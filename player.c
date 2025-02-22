@@ -9,30 +9,27 @@
 #include <libswscale/swscale.h>
 
 #define MIN_WINDOW_HEIGHT 200
+#define DEFAULT_WINDOW_HEIGHT 600
 
 #define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
 #define LOG(fmt, ...) printf("LOG: "fmt"\n", ##__VA_ARGS__)
 
 typedef struct {
     AVFormatContext *format_ctx;
-
     // Codecs
-    const AVCodec *v_codec;
-    AVCodecContext *v_codec_ctx;
-    int v_codec_index;
-
-    const AVCodec *a_codec;
-    AVCodecContext *a_codec_ctx;
-    int a_codec_index;
+    AVCodecContext *v_ctx;
+    int v_index;
+    AVCodecContext *a_ctx;
+    int a_index;
 
     AVPacket *packet;
     AVFrame *frame;
-    int fps;
 
     bool done;
+    int fps;
+    double pts;
     double current_time;
     double start_time;
-    double pts;
 } AVContext;
 
 // Globals
@@ -53,47 +50,41 @@ void init_av_streaming(char *video_file, AVContext *ctx)
     if (avformat_open_input(&ctx->format_ctx, video_file, NULL, NULL) != 0) {
         ERROR("Could not open video file %s", video_file);
     }
-
     LOG("Format %s\n", ctx->format_ctx->iformat->long_name);
 
-    // find streams and set int context
+    // find the streams in the format
     if (avformat_find_stream_info(ctx->format_ctx, NULL) < 0)
         ERROR("Could not find stream info");
 
-    // get codecs and paramaters
-    for (size_t i = 0; i < ctx->format_ctx->nb_streams; i++) {
-        AVCodecParameters *codec_params = ctx->format_ctx->streams[i]->codecpar;
-        const AVCodec *codec = avcodec_find_decoder(codec_params->codec_id);
+    //---Codecs---
+    const AVCodec *codec;
+    // video codec
+    ctx->v_index = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    ctx->v_ctx = avcodec_alloc_context3(codec);
+    if (avcodec_parameters_to_context(ctx->v_ctx, 
+        ctx->format_ctx->streams[ctx->v_index]->codecpar) < 0)
+        ERROR("could not create video codec context");
 
-        // initialize video codec
-        if (codec_params->codec_type == AVMEDIA_TYPE_VIDEO) {
-            LOG("Video %dx%d at %dfps", codec_params->width, codec_params->height,
-                codec_params->framerate.num / codec_params->framerate.den);
+    AVRational framerate = ctx->format_ctx->streams[ctx->v_index]->avg_frame_rate;
+    ctx->fps = framerate.num / ctx->v_ctx->framerate.den;
+    ctx->v_ctx->time_base = ctx->format_ctx->streams[ctx->v_index]->time_base;
+    LOG("Video %dx%d at %dfps", ctx->v_ctx->width, ctx->v_ctx->height, ctx->fps);
+    LOG("Codec %s ID %d bitrate %ld\n", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
 
-            ctx->v_codec = codec;
-            ctx->v_codec_ctx = avcodec_alloc_context3(ctx->v_codec);
-            if (avcodec_parameters_to_context(ctx->v_codec_ctx, codec_params) < 0)
-                ERROR("could not create video codec context");
-            ctx->v_codec_ctx->framerate = ctx->format_ctx->streams[i]->avg_frame_rate;
-            ctx->fps = ctx->v_codec_ctx->framerate.num / ctx->v_codec_ctx->framerate.den;
-            ctx->v_codec_ctx->time_base = ctx->format_ctx->streams[i]->time_base;
-            ctx->v_codec_index = i;
-        } else if (codec_params->codec_type == AVMEDIA_TYPE_AUDIO){
-            // initialize audio codec
-            LOG("Audio %d chanels, sample rate %dHZ", 
-                   codec_params->ch_layout.nb_channels, codec_params->sample_rate);
-            ctx->a_codec = codec;
-            ctx->a_codec_ctx = avcodec_alloc_context3(ctx->a_codec);
-            if (avcodec_parameters_to_context(ctx->a_codec_ctx, codec_params) < 0)
-                ERROR("could not create audio codec context");
-            ctx->a_codec_index = i;
-        }
-            LOG("Codec %s ID %d bitrate %ld\n", codec->long_name, codec->id, codec_params->bit_rate);
-    }
+    // initialize audio codec
+    ctx->a_index = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_AUDIO, -1, ctx->v_index, &codec, 0);
+    ctx->a_ctx = avcodec_alloc_context3(codec);
+    if (avcodec_parameters_to_context(ctx->a_ctx,
+        ctx->format_ctx->streams[ctx->a_index]->codecpar) < 0)
+        ERROR("could not create audio codec context");
 
-    // open the initialized codecs
-    if (avcodec_open2(ctx->v_codec_ctx, ctx->v_codec, NULL) < 0)
-        ERROR("Could not open vide0 codec");
+    LOG("Audio %d chanels, sample rate %dHZ", 
+                   ctx->a_ctx->ch_layout.nb_channels, ctx->a_ctx->sample_rate);
+    LOG("Codec %s ID %d bitrate %ld\n", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
+
+    // open the initialized codecs for use
+    if (avcodec_open2(ctx->v_ctx, ctx->v_ctx->codec, NULL) < 0)
+        ERROR("Could not open video codec");
      
 
     // allocate for the packet and frame components
@@ -102,6 +93,39 @@ void init_av_streaming(char *video_file, AVContext *ctx)
     if (ctx->packet == NULL || ctx->frame == NULL)
         ERROR("Could not alloc packet or frame");
     return;
+}
+
+void deinit_av_streaming(AVContext *ctx)
+{
+    av_frame_free(&ctx->frame);
+    av_packet_free(&ctx->packet);
+    avcodec_free_context(&ctx->v_ctx);
+    avcodec_free_context(&ctx->a_ctx);
+    avformat_free_context(ctx->format_ctx);
+}
+
+// setup conversion
+void init_frame_conversion(AVContext *ctx, AVFrame **out_frame, struct SwsContext **sws_ctx)
+{
+    enum AVPixelFormat format = ctx->v_ctx->pix_fmt;
+    int vid_width = ctx->v_ctx->width, vid_height = ctx->v_ctx->height;
+    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, vid_width, vid_height, 1);
+    struct SwsContext *local_sws_ctx = sws_getContext(vid_width, vid_height, format, 
+                                                vid_width, vid_height, AV_PIX_FMT_RGB24,
+                                                SWS_BILINEAR, NULL, NULL, NULL);
+    if (sws_ctx == NULL)
+        ERROR("Failed to get sws context");
+
+    AVFrame *frame = av_frame_alloc();
+    unsigned char *frame_buf = malloc(num_bytes);
+    int ret = av_image_fill_arrays(frame->data, frame->linesize,
+                         frame_buf, AV_PIX_FMT_RGB24, vid_width, vid_height, 1);
+    if (ret < 0) ERROR("Could not initialize out frame image");
+    frame->width = vid_width;
+    frame->height = vid_height;
+
+    *sws_ctx = local_sws_ctx;
+    *out_frame = frame;
 }
 
 void update_surface(Texture surface, AVFrame *out_frame, AVContext *ctx, struct SwsContext *sws_ctx)
@@ -113,11 +137,10 @@ void update_surface(Texture surface, AVFrame *out_frame, AVContext *ctx, struct 
 
     ctx->current_time = GetTime();
 
-    double pts_time = ctx->pts * 
-        ((double)ctx->v_codec_ctx->time_base.num / ctx->v_codec_ctx->time_base.den);
+    double pts_time = ctx->pts * av_q2d(ctx->v_ctx->time_base);
     if ((ctx->current_time - ctx->start_time) >= pts_time) {
         // increment presentation time
-        ctx->pts += ctx->v_codec_ctx->time_base.den / ctx->fps;
+        ctx->pts += (double)ctx->v_ctx->time_base.den / ctx->fps;
 
         AVFrame **frame = &frame_queue[frame_queue_front];
         frame_queue_front = (frame_queue_front + 1) % frame_queue_cap;
@@ -128,7 +151,6 @@ void update_surface(Texture surface, AVFrame *out_frame, AVContext *ctx, struct 
         sws_scale(sws_ctx, (const uint8_t *const *)((*frame)->data), (*frame)->linesize,
                   0, surface.height, out_frame->data, out_frame->linesize);
         UpdateTexture(surface, out_frame->data[0]);
-
 
         av_frame_free(frame);
     }
@@ -146,28 +168,16 @@ int main(int argc, char *argv[])
     AVContext ctx;
     init_av_streaming(video_file, &ctx);
 
-    // setup conversion
-    enum AVPixelFormat format = ctx.v_codec_ctx->pix_fmt;
-    int vid_width = ctx.v_codec_ctx->width, vid_height = ctx.v_codec_ctx->height;
-    int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, vid_width, vid_height, 1);
-    struct SwsContext *sws_ctx = sws_getContext(vid_width, vid_height, format, 
-                                                vid_width, vid_height, AV_PIX_FMT_RGB24,
-                                                SWS_BILINEAR, NULL, NULL, NULL);
-    if (sws_ctx == NULL)
-        ERROR("Failed to get sws context");
-
-    AVFrame *out_frame = av_frame_alloc();
-    unsigned char *frame_buf = malloc(num_bytes);
-    int ret = av_image_fill_arrays(out_frame->data, out_frame->linesize,
-                         frame_buf, AV_PIX_FMT_RGB24, vid_width, vid_height, 1);
-    if (ret < 0) ERROR("Could not initialize out frame image");
-    out_frame->width = vid_width;
-    out_frame->height = vid_height;
+    struct SwsContext *sws_ctx;
+    AVFrame *out_frame;
+    init_frame_conversion(&ctx, &out_frame, &sws_ctx);
 
     // Initialize raylib
+    int vid_width = ctx.v_ctx->width, vid_height = ctx.v_ctx->height;
     SetConfigFlags(FLAG_WINDOW_RESIZABLE|FLAG_VSYNC_HINT);
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(vid_width, vid_height, ctx.format_ctx->url);
+    InitWindow(DEFAULT_WINDOW_HEIGHT * vid_width / vid_height,
+               DEFAULT_WINDOW_HEIGHT, ctx.format_ctx->url);
     SetWindowMinSize(MIN_WINDOW_HEIGHT * vid_width / vid_height, MIN_WINDOW_HEIGHT);
 
     Image img = {
@@ -193,17 +203,18 @@ int main(int argc, char *argv[])
         if (!ctx.done && (next + 1) != frame_queue_front) {
             av_read_frame(ctx.format_ctx, ctx.packet);
             // skip audio
-            if (ctx.packet->stream_index != ctx.v_codec_index) {
+            if (ctx.packet->stream_index != ctx.v_index) {
                 av_packet_unref(ctx.packet);
                 continue;
             }
 
-            avcodec_send_packet(ctx.v_codec_ctx, ctx.packet);
+            avcodec_send_packet(ctx.v_ctx, ctx.packet);
             av_packet_unref(ctx.packet);
             // decoded frame
-            int ret = avcodec_receive_frame(ctx.v_codec_ctx, ctx.frame);
+            int ret = avcodec_receive_frame(ctx.v_ctx, ctx.frame);
             if (ret == AVERROR_EOF) {
                 ctx.done = true;
+                deinit_av_streaming(&ctx);
                 continue;
             }
             
@@ -212,10 +223,10 @@ int main(int argc, char *argv[])
             frame_queue_len++;
         }
 
+        update_surface(surface, out_frame, &ctx, sws_ctx);
+
         // Rendering
         ClearBackground(BLACK);
-
-        update_surface(surface, out_frame, &ctx, sws_ctx);
 
         // Handle Window resizing
         Rectangle src = {0, 0, surface.width, surface.height};
@@ -252,7 +263,6 @@ int main(int argc, char *argv[])
         }
 
     }
-
     sws_freeContext(sws_ctx);
     av_frame_free(&out_frame);
 
