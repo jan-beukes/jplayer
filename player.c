@@ -11,7 +11,7 @@
 #define MIN_WINDOW_HEIGHT 200
 #define DEFAULT_WINDOW_HEIGHT 600
 
-#define TIME_FONT_SCALE 0.05f
+#define TIME_FONT_SCALE 0.04f
 #define PAUSE_FONT_SCALE 0.1f
 
 
@@ -265,6 +265,7 @@ int main(int argc, char *argv[])
     fqueue.cap = QUEUE_CAP;
     for (int i = 0; i < fqueue.cap; i++) fqueue.items[i] = av_frame_alloc();
 
+    LOG("PLAYING...");
     while (!WindowShouldClose()) {
 
         // dont decode frames if queue is full
@@ -298,7 +299,7 @@ int main(int argc, char *argv[])
             DrawTexturePro(surface, src, dst, (Vector2){0}, 0, WHITE);
 
         //---UI-OVERLAY---
-        float font_size = screen_height * TIME_FONT_SCALE;
+        float font_size = height * TIME_FONT_SCALE;
         // Time
         int duration = ctx.format_ctx->duration / AV_TIME_BASE;
         int current_time = ctx.video_time;
@@ -306,12 +307,11 @@ int main(int argc, char *argv[])
         char *cur_time_str = get_time_string(buf1, current_time);
         char *dur_str = get_time_string(buf2, duration);
         const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
-        x = 10, y = 10;
         DrawText(text, x, y, font_size, RAYWHITE);
 
         // Pause
         if (ctx.paused) {
-            font_size = screen_height * PAUSE_FONT_SCALE;
+            font_size = height * PAUSE_FONT_SCALE;
             text = TextFormat("Paused");
             int text_width = MeasureText(text, font_size);
             x = (screen_width - text_width) / 2, y = (screen_height - (int)font_size) / 2;
