@@ -11,8 +11,19 @@
 #define MIN_WINDOW_HEIGHT 200
 #define DEFAULT_WINDOW_HEIGHT 600
 
+#define TIME_FONT_SCALE 0.05f
+#define PAUSE_FONT_SCALE 0.1f
+
+
 #define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
 #define LOG(fmt, ...) printf("LOG: "fmt"\n", ##__VA_ARGS__)
+#define WARN(fmt, ...) printf("WARN: "fmt"\n", ##__VA_ARGS__)
+
+// Queue stuff
+#define QUEUE_EMPTY(Q) (Q.rindex == Q.windex)
+#define QUEUE_FULL(Q) ((Q.windex + 1) % Q.cap == Q.rindex)
+#define QUEUE_INC(Q) ({ Q.windex++; if (Q.windex >= Q.cap) Q.windex = 0; })
+#define QUEUE_NEXT(Q) ({ Q.rindex++; if (Q.rindex >= Q.cap) Q.rindex = 0; })
 
 typedef struct {
     AVFormatContext *format_ctx;
@@ -22,32 +33,63 @@ typedef struct {
     AVCodecContext *a_ctx;
     int a_index;
 
-    AVPacket *packet;
-    AVFrame *frame;
+    struct SwsContext *sws_ctx;
 
-    bool done;
+    AVPacket *packet;
+    AVFrame *out_frame;
+
+    bool video_active;
+    bool decoding_active;
+    bool paused;
     int fps;
-    double pts;
-    double current_time;
+    double video_time;
+    double pause_time;
     double start_time;
-} AVContext;
+} VideoContext;
+
+#define QUEUE_CAP 256
+typedef struct FrameQueue {
+    AVFrame **items;
+    int cap;
+    int windex;
+    int rindex;
+} FrameQueue;
 
 // Globals
-
-// frame queue ring buffer
-AVFrame **frame_queue;
-size_t frame_queue_len;
-size_t frame_queue_cap;
-int frame_queue_front;
+FrameQueue fqueue = {0};
 
 bool pressed_last_frame = false;
 int press_frame_count = 0;
 
-void init_av_streaming(char *video_file, AVContext *ctx)
+char *get_time_string(char *buf, int seconds)
+{
+    if (seconds < 60*60) {
+        int s = seconds % 60;
+        int m = seconds / 60;
+        sprintf(buf, "%02d:%02d", m, s);
+        return buf;
+    } else {
+        int s = seconds % 60;
+        int m = seconds / 60;
+        int h = seconds / (60*60);
+        sprintf(buf, "%02d:%02d:%02d", h, m, s);
+        return buf;
+    }
+
+}
+
+void init_av_streaming(char *video_file, VideoContext *ctx)
 {
     // allocate format context and read format from file
     ctx->format_ctx = avformat_alloc_context();
     if (avformat_open_input(&ctx->format_ctx, video_file, NULL, NULL) != 0) {
+        // dont error if window is active
+        if (IsWindowReady()) {
+            LOG("Could not open video file %s", video_file);
+            ctx->decoding_active = false;
+            ctx->video_active = false;
+            return;
+        }
         ERROR("Could not open video file %s", video_file);
     }
     LOG("Format %s\n", ctx->format_ctx->iformat->long_name);
@@ -89,72 +131,103 @@ void init_av_streaming(char *video_file, AVContext *ctx)
 
     // allocate for the packet and frame components
     ctx->packet = av_packet_alloc();
-    ctx->frame = av_frame_alloc();
-    if (ctx->packet == NULL || ctx->frame == NULL)
+    if (ctx->packet == NULL)
         ERROR("Could not alloc packet or frame");
+
+    ctx->decoding_active = true;
+    ctx->video_active = true;
     return;
 }
 
-void deinit_av_streaming(AVContext *ctx)
+void deinit_av_streaming(VideoContext *ctx)
 {
-    av_frame_free(&ctx->frame);
+    for (int i = 0; i < fqueue.cap; i++)
+        av_frame_free(&fqueue.items[i]);
     av_packet_free(&ctx->packet);
+    av_frame_free(&ctx->out_frame);
     avcodec_free_context(&ctx->v_ctx);
     avcodec_free_context(&ctx->a_ctx);
     avformat_free_context(ctx->format_ctx);
+    sws_freeContext(ctx->sws_ctx);
 }
 
 // setup conversion
-void init_frame_conversion(AVContext *ctx, AVFrame **out_frame, struct SwsContext **sws_ctx)
+void init_frame_conversion(VideoContext *ctx)
 {
     enum AVPixelFormat format = ctx->v_ctx->pix_fmt;
     int vid_width = ctx->v_ctx->width, vid_height = ctx->v_ctx->height;
     int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, vid_width, vid_height, 1);
-    struct SwsContext *local_sws_ctx = sws_getContext(vid_width, vid_height, format, 
+    ctx->sws_ctx = sws_getContext(vid_width, vid_height, format, 
                                                 vid_width, vid_height, AV_PIX_FMT_RGB24,
                                                 SWS_BILINEAR, NULL, NULL, NULL);
-    if (sws_ctx == NULL)
+    if (ctx->sws_ctx == NULL)
         ERROR("Failed to get sws context");
 
-    AVFrame *frame = av_frame_alloc();
+    ctx->out_frame = av_frame_alloc();
     unsigned char *frame_buf = malloc(num_bytes);
-    int ret = av_image_fill_arrays(frame->data, frame->linesize,
+    int ret = av_image_fill_arrays(ctx->out_frame->data, ctx->out_frame->linesize,
                          frame_buf, AV_PIX_FMT_RGB24, vid_width, vid_height, 1);
     if (ret < 0) ERROR("Could not initialize out frame image");
-    frame->width = vid_width;
-    frame->height = vid_height;
-
-    *sws_ctx = local_sws_ctx;
-    *out_frame = frame;
+    ctx->out_frame->width = vid_width;
+    ctx->out_frame->height = vid_height;
 }
 
-void update_surface(Texture surface, AVFrame *out_frame, AVContext *ctx, struct SwsContext *sws_ctx)
+void update_frames(Texture surface, VideoContext *ctx)
 {
-    if (ctx->done && frame_queue_len == 0) return;
+    // Time updates
+    if (ctx->start_time == 0.0) ctx->start_time = GetTime();
+    ctx->video_time = GetTime() - ctx->start_time;
 
-    // time 
-    if (ctx->start_time == 0) ctx->start_time = GetTime();
+    AVFrame *frame = fqueue.items[fqueue.rindex];
+    double next_ts = frame->pts * av_q2d(ctx->v_ctx->time_base);
 
-    ctx->current_time = GetTime();
-
-    double pts_time = ctx->pts * av_q2d(ctx->v_ctx->time_base);
-    if ((ctx->current_time - ctx->start_time) >= pts_time) {
-        // increment presentation time
-        ctx->pts += (double)ctx->v_ctx->time_base.den / ctx->fps;
-
-        AVFrame **frame = &frame_queue[frame_queue_front];
-        frame_queue_front = (frame_queue_front + 1) % frame_queue_cap;
-        frame_queue_len--;
+    if (ctx->video_time >= next_ts) {
+        QUEUE_NEXT(fqueue);
 
         // convert to rgb
-        if ((*frame)->data[0] == NULL) ERROR("NULL Frame");
-        sws_scale(sws_ctx, (const uint8_t *const *)((*frame)->data), (*frame)->linesize,
-                  0, surface.height, out_frame->data, out_frame->linesize);
-        UpdateTexture(surface, out_frame->data[0]);
-
-        av_frame_free(frame);
+        if (frame->data[0] == NULL) ERROR("NULL Frame");
+        sws_scale(ctx->sws_ctx, (const uint8_t *const *)(frame->data), frame->linesize,
+                  0, surface.height, ctx->out_frame->data, ctx->out_frame->linesize);
+        UpdateTexture(surface, ctx->out_frame->data[0]);
+        av_frame_unref(frame);
     }
 
+}
+
+bool decode(VideoContext *ctx)
+{
+    int ret;
+    ret = av_read_frame(ctx->format_ctx, ctx->packet);
+    if (ret != 0 && ret != AVERROR_EOF) {
+        LOG("reading frame, %s", av_err2str(ret));
+    }
+    // skip audio
+    if (ctx->packet->stream_index != ctx->v_index) {
+        av_packet_unref(ctx->packet);
+        return false;
+    }
+
+    ret = avcodec_send_packet(ctx->v_ctx, ctx->packet);
+    av_packet_unref(ctx->packet);
+    if (ret != 0 && ret != AVERROR_EOF) {
+        WARN("sending packet, %s", av_err2str(ret));
+        return false;
+    }
+    // decoded frame
+    ret = avcodec_receive_frame(ctx->v_ctx, fqueue.items[fqueue.windex]);
+    if (ret == AVERROR(EAGAIN)) return false;
+    if (ret == AVERROR_EOF) {
+        // Video done
+        ctx->decoding_active = false;
+        LOG("VIDEO DECODING DONE");
+        return false;
+    } else if (ret < 0) {
+        WARN("receiving frame, %s", av_err2str(ret));
+        return false;
+    }
+    QUEUE_INC(fqueue);
+
+    return true;
 }
 
 int main(int argc, char *argv[])
@@ -165,12 +238,9 @@ int main(int argc, char *argv[])
     }
     char *video_file = argv[1];
 
-    AVContext ctx;
+    VideoContext ctx = {0};
     init_av_streaming(video_file, &ctx);
-
-    struct SwsContext *sws_ctx;
-    AVFrame *out_frame;
-    init_frame_conversion(&ctx, &out_frame, &sws_ctx);
+    init_frame_conversion(&ctx);
 
     // Initialize raylib
     int vid_width = ctx.v_ctx->width, vid_height = ctx.v_ctx->height;
@@ -185,45 +255,28 @@ int main(int argc, char *argv[])
         .height = vid_height,
         .mipmaps = 1,
         .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8,
-        .data = out_frame->data[0],
+        .data = ctx.out_frame->data[0],
     };
     Texture surface = LoadTextureFromImage(img);
     SetTextureFilter(surface, TEXTURE_FILTER_BILINEAR);
 
-    frame_queue_cap = ctx.format_ctx->max_probe_packets/10;
-    frame_queue = malloc(frame_queue_cap * sizeof(AVFrame *));
-    frame_queue_len = 0;
-    frame_queue_front = 0;
+    // frame queue
+    fqueue.items = av_malloc_array(QUEUE_CAP, sizeof(AVFrame *));
+    fqueue.cap = QUEUE_CAP;
+    for (int i = 0; i < fqueue.cap; i++) fqueue.items[i] = av_frame_alloc();
 
-    ctx.start_time = 0, ctx.current_time = 0;
-    ctx.done = false;
     while (!WindowShouldClose()) {
-        int next = (frame_queue_front + frame_queue_len) % frame_queue_cap;
-        // dont read frames if queue is full
-        if (!ctx.done && (next + 1) != frame_queue_front) {
-            av_read_frame(ctx.format_ctx, ctx.packet);
-            // skip audio
-            if (ctx.packet->stream_index != ctx.v_index) {
-                av_packet_unref(ctx.packet);
-                continue;
-            }
 
-            avcodec_send_packet(ctx.v_ctx, ctx.packet);
-            av_packet_unref(ctx.packet);
-            // decoded frame
-            int ret = avcodec_receive_frame(ctx.v_ctx, ctx.frame);
-            if (ret == AVERROR_EOF) {
-                ctx.done = true;
-                deinit_av_streaming(&ctx);
-                continue;
-            }
-            
-            frame_queue[next] = av_frame_clone(ctx.frame);
-            av_frame_unref(ctx.frame);
-            frame_queue_len++;
+        // dont decode frames if queue is full
+        if (ctx.decoding_active && !QUEUE_FULL(fqueue)) {
+            if(!decode(&ctx)) continue;
+        } else if (ctx.video_active && !ctx.decoding_active && QUEUE_EMPTY(fqueue)) {
+            deinit_av_streaming(&ctx);
+            ctx.video_active = false;
         }
 
-        update_surface(surface, out_frame, &ctx, sws_ctx);
+        if (!ctx.paused && ctx.video_active)
+            update_frames(surface, &ctx);
 
         // Rendering
         ClearBackground(BLACK);
@@ -241,10 +294,42 @@ int main(int argc, char *argv[])
         int x = (screen_width - width) / 2;
         int y = (screen_height - height) / 2;
         Rectangle dst = {x, y, width, height};
-        DrawTexturePro(surface, src, dst, (Vector2){0}, 0, WHITE);
+        if (ctx.video_active)
+            DrawTexturePro(surface, src, dst, (Vector2){0}, 0, WHITE);
+
+        //---UI-OVERLAY---
+        float font_size = screen_height * TIME_FONT_SCALE;
+        // Time
+        int duration = ctx.format_ctx->duration / AV_TIME_BASE;
+        int current_time = ctx.video_time;
+        char buf1[128], buf2[128];
+        char *cur_time_str = get_time_string(buf1, current_time);
+        char *dur_str = get_time_string(buf2, duration);
+        const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
+        x = 10, y = 10;
+        DrawText(text, x, y, font_size, RAYWHITE);
+
+        // Pause
+        if (ctx.paused) {
+            font_size = screen_height * PAUSE_FONT_SCALE;
+            text = TextFormat("Paused");
+            int text_width = MeasureText(text, font_size);
+            x = (screen_width - text_width) / 2, y = (screen_height - (int)font_size) / 2;
+            DrawText(text, x, y, font_size, RED);
+        }
+
         EndDrawing();
 
         // Events
+        if (IsKeyPressed(KEY_SPACE)) {
+            if (ctx.paused) {
+                ctx.start_time += (GetTime() - ctx.pause_time);
+                ctx.paused = false;
+            } else {
+                ctx.pause_time = GetTime();
+                ctx.paused = true;
+            }
+        }
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             if (pressed_last_frame) {
                 if (IsWindowState(FLAG_WINDOW_MAXIMIZED))
@@ -263,8 +348,6 @@ int main(int argc, char *argv[])
         }
 
     }
-    sws_freeContext(sws_ctx);
-    av_frame_free(&out_frame);
 
     return 0;
 }
