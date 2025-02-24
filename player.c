@@ -225,10 +225,10 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 
     // setup fps and time_base for vido ctx
     AVRational framerate = ctx->format_ctx->streams[ctx->v_index]->avg_frame_rate;
-    ctx->fps = framerate.num / ctx->v_ctx->framerate.den;
+    ctx->fps = framerate.num / framerate.den;
     ctx->v_ctx->time_base = ctx->format_ctx->streams[ctx->v_index]->time_base;
     LOG("Video %dx%d at %dfps", ctx->v_ctx->width, ctx->v_ctx->height, ctx->fps);
-    LOG("Codec %s ID %d bitrate %ld", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
+    LOG("Codec %s ID %d", codec->long_name, codec->id);
 
     // initialize audio codec
     // if we are using seperated streams then audio must be in context 2
@@ -243,7 +243,7 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 
     LOG("Audio %d chanels, sample rate %dHZ", 
         ctx->a_ctx->ch_layout.nb_channels, ctx->a_ctx->sample_rate);
-    LOG("Codec %s ID %d bitrate %ld", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
+    LOG("Codec %s ID %d", codec->long_name, codec->id);
 
     // open the initialized codecs for use
     if (avcodec_open2(ctx->v_ctx, ctx->v_ctx->codec, NULL) < 0)

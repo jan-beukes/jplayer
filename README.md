@@ -21,5 +21,5 @@ jplay <video file/url>
 ```
 If yt-dlp is in PATH
 ```
-jplay <youtube link>
+jplay [-- OPTIONS] <youtube link>
 ```
