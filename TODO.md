@@ -1,4 +1,4 @@
 # TODO
+- [x] yt-dlp integration
 - [ ] Audio with control
-- [ ] yt-dlp integration
 - [ ] seeking

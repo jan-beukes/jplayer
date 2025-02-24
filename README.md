@@ -16,4 +16,10 @@ make BUILD_RAYLIB=TRUE VENDOR_FFMPEG=FALSE
 
 
 ## Usage
-...
+```
+jplay <video file/url>
+```
+If yt-dlp is in PATH
+```
+jplay <youtube link>
+```
