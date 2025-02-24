@@ -1,4 +1,5 @@
-j-play
+jplay
 misc
+lib/*
 *.mp4
 *.webm

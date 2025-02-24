@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #include <raylib.h>
 #include <libavcodec/avcodec.h>
@@ -102,6 +103,8 @@ void init_av_streaming(char *video_file, VideoContext *ctx)
     const AVCodec *codec;
     // video codec
     ctx->v_index = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (ctx->v_index < 0) ERROR("Could not find video stream");
+
     ctx->v_ctx = avcodec_alloc_context3(codec);
     if (avcodec_parameters_to_context(ctx->v_ctx, 
         ctx->format_ctx->streams[ctx->v_index]->codecpar) < 0)
@@ -115,6 +118,7 @@ void init_av_streaming(char *video_file, VideoContext *ctx)
 
     // initialize audio codec
     ctx->a_index = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_AUDIO, -1, ctx->v_index, &codec, 0);
+    if (ctx->a_index < 0) ERROR("Could not find audio stream");
     ctx->a_ctx = avcodec_alloc_context3(codec);
     if (avcodec_parameters_to_context(ctx->a_ctx,
         ctx->format_ctx->streams[ctx->a_index]->codecpar) < 0)
@@ -132,7 +136,7 @@ void init_av_streaming(char *video_file, VideoContext *ctx)
     // allocate for the packet and frame components
     ctx->packet = av_packet_alloc();
     if (ctx->packet == NULL)
-        ERROR("Could not alloc packet or frame");
+        ERROR("Could not alloc packet");
 
     ctx->decoding_active = true;
     ctx->video_active = true;
@@ -179,6 +183,7 @@ void update_frames(Texture surface, VideoContext *ctx)
     ctx->video_time = GetTime() - ctx->start_time;
 
     AVFrame *frame = fqueue.items[fqueue.rindex];
+    assert(frame != NULL);
     double next_ts = frame->pts * av_q2d(ctx->v_ctx->time_base);
 
     if (ctx->video_time >= next_ts) {
@@ -199,7 +204,7 @@ bool decode(VideoContext *ctx)
     int ret;
     ret = av_read_frame(ctx->format_ctx, ctx->packet);
     if (ret != 0 && ret != AVERROR_EOF) {
-        LOG("reading frame, %s", av_err2str(ret));
+        WARN("reading frame, %s", av_err2str(ret));
     }
     // skip audio
     if (ctx->packet->stream_index != ctx->v_index) {
