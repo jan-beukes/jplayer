@@ -8,13 +8,10 @@ libraries
 - raylib
 - yt-dlp (optional)
 
-Both raylib and the ffmpeg libraries can be vendored.
-This is configured in the Makefile
-
 ```
 git clone --recurse-submodules https://github.com/jan-beukes/jplayer.git
 cd jplayer
-make all
+make BUILD_RAYLIB=TRUE VENDOR_FFMPEG=FALSE
 ```
 
 

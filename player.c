@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #include <raylib.h>
@@ -15,7 +16,6 @@
 #define TIME_FONT_SCALE 0.04f
 #define PAUSE_FONT_SCALE 0.1f
 
-
 #define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
 #define LOG(fmt, ...) printf("LOG: "fmt"\n", ##__VA_ARGS__)
 #define WARN(fmt, ...) printf("WARN: "fmt"\n", ##__VA_ARGS__)
@@ -27,17 +27,20 @@
 #define QUEUE_NEXT(Q) ({ Q.rindex++; if (Q.rindex >= Q.cap) Q.rindex = 0; })
 
 typedef struct {
-    AVFormatContext *format_ctx;
+    AVFormatContext *format_ctx; // The context of the opened the file/stream
+    AVFormatContext *format_ctx2; // used for split audio
+
     // Codecs
     AVCodecContext *v_ctx;
     int v_index;
     AVCodecContext *a_ctx;
     int a_index;
 
-    struct SwsContext *sws_ctx;
-
     AVPacket *packet;
+    AVPacket *a_packet; // used for split audio
     AVFrame *out_frame;
+
+    struct SwsContext *sws_ctx;
 
     bool video_active;
     bool decoding_active;
@@ -48,7 +51,7 @@ typedef struct {
     double start_time;
 } VideoContext;
 
-#define QUEUE_CAP 256
+#define FRAME_QUEUE_CAP 16
 typedef struct FrameQueue {
     AVFrame **items;
     int cap;
@@ -56,8 +59,18 @@ typedef struct FrameQueue {
     int rindex;
 } FrameQueue;
 
+#define PACKET_QUEUE_CAP 64
+typedef struct PacketQueue {
+    AVPacket **items;
+    int cap;
+    int windex;
+    int rindex;
+} PacketQueue;
+
 // Globals
-FrameQueue fqueue = {0};
+PacketQueue packets = {0};
+FrameQueue v_queue = {0};
+FrameQueue a_queue = {0};
 
 bool pressed_last_frame = false;
 int press_frame_count = 0;
@@ -78,65 +91,119 @@ char *get_time_string(char *buf, int seconds)
     }
 
 }
-
-void init_av_streaming(char *video_file, VideoContext *ctx)
+ 
+#define URL_MAX_LEN 2048
+// initialize format context from youtube url
+void init_format_yt(char *video_file, VideoContext *ctx)
 {
-    // allocate format context and read format from file
-    ctx->format_ctx = avformat_alloc_context();
-    if (avformat_open_input(&ctx->format_ctx, video_file, NULL, NULL) != 0) {
-        // dont error if window is active
-        if (IsWindowReady()) {
-            LOG("Could not open video file %s", video_file);
-            ctx->decoding_active = false;
-            ctx->video_active = false;
-            return;
-        }
-        ERROR("Could not open video file %s", video_file);
-    }
-    LOG("Format %s\n", ctx->format_ctx->iformat->long_name);
+    LOG("initializing youtube streaming...");
+    char cmd[1024];
+    snprintf(cmd, 1024, "yt-dlp --get-url %s", video_file);
+    FILE *yt_stdout = popen(cmd, "r");
+    if (yt_stdout == NULL) ERROR("popen");
 
-    // find the streams in the format
+    char url_buf[URL_MAX_LEN];
+    char url_buf2[URL_MAX_LEN];
+    fgets(url_buf, URL_MAX_LEN, yt_stdout);
+    char *ret = fgets(url_buf2, URL_MAX_LEN, yt_stdout);
+    if (pclose(yt_stdout) != 0) ERROR("failed to retrieve video with yt-dlp");
+
+    // open the video file from url
+    ctx->format_ctx = avformat_alloc_context();
+    if (avformat_open_input(&ctx->format_ctx, url_buf, NULL, NULL) != 0)
+        ERROR("Could not open youtube video %s", video_file);
     if (avformat_find_stream_info(ctx->format_ctx, NULL) < 0)
         ERROR("Could not find stream info");
+    LOG("Format %s", ctx->format_ctx->iformat->long_name);
+
+    // if two streams were returned open the audio file into format_ctx2
+    if (ret != NULL) {
+        ctx->format_ctx2 = avformat_alloc_context();
+        if (avformat_open_input(&ctx->format_ctx2, url_buf2, NULL, NULL) != 0)
+            ERROR("Could not open youtube video %s", video_file);
+        if (avformat_find_stream_info(ctx->format_ctx2, NULL) < 0)
+            ERROR("Could not find stream info");
+    }
+}
+
+#define YT_DOMAIN "https://www.youtube.com"
+void init_av_streaming(char *video_file, VideoContext *ctx)
+{
+    av_log_set_level(AV_LOG_ERROR);
+    LOG("LOADING VIDEO");
+    //---Format---
+    if (strncmp(video_file,  YT_DOMAIN, strlen(YT_DOMAIN)) == 0) {
+        init_format_yt(video_file, ctx);
+    } else {
+        ctx->format_ctx = avformat_alloc_context();
+        // allocate format context and read format from file
+        if (avformat_open_input(&ctx->format_ctx, video_file, NULL, NULL) != 0)
+            ERROR("Could not open video file %s", video_file);
+
+        LOG("Format %s", ctx->format_ctx->iformat->long_name);
+        // find the streams in the format
+        if (avformat_find_stream_info(ctx->format_ctx, NULL) < 0)
+            ERROR("Could not find stream info");
+    }
 
     //---Codecs---
+    int ret;
     const AVCodec *codec;
-    // video codec
-    ctx->v_index = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
-    if (ctx->v_index < 0) ERROR("Could not find video stream");
 
+    // find video stream
+    ret = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (ret < 0 && ctx->format_ctx2) {
+        ret = av_find_best_stream(ctx->format_ctx2, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+        if (ret < 0) ERROR("Could not find a video stream");
+        // swap so that video is in ctx 1
+        AVFormatContext *tmp = ctx->format_ctx;
+        ctx->format_ctx = ctx->format_ctx2;
+        ctx->format_ctx2 = tmp;
+    }
+    ctx->v_index = ret;
     ctx->v_ctx = avcodec_alloc_context3(codec);
+    // create vido codec ctx
     if (avcodec_parameters_to_context(ctx->v_ctx, 
         ctx->format_ctx->streams[ctx->v_index]->codecpar) < 0)
         ERROR("could not create video codec context");
 
+    // setup fps and time_base for vido ctx
     AVRational framerate = ctx->format_ctx->streams[ctx->v_index]->avg_frame_rate;
     ctx->fps = framerate.num / ctx->v_ctx->framerate.den;
     ctx->v_ctx->time_base = ctx->format_ctx->streams[ctx->v_index]->time_base;
     LOG("Video %dx%d at %dfps", ctx->v_ctx->width, ctx->v_ctx->height, ctx->fps);
-    LOG("Codec %s ID %d bitrate %ld\n", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
+    LOG("Codec %s ID %d bitrate %ld", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
 
     // initialize audio codec
-    ctx->a_index = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_AUDIO, -1, ctx->v_index, &codec, 0);
+    // if we are using seperated streams then audio must be in context 2
+    AVFormatContext *audio_ctx = ctx->format_ctx2 ? ctx->format_ctx2 : ctx->format_ctx;
+
+    ctx->a_index = av_find_best_stream(audio_ctx, AVMEDIA_TYPE_AUDIO, -1, ctx->v_index, &codec, 0);
     if (ctx->a_index < 0) ERROR("Could not find audio stream");
     ctx->a_ctx = avcodec_alloc_context3(codec);
     if (avcodec_parameters_to_context(ctx->a_ctx,
-        ctx->format_ctx->streams[ctx->a_index]->codecpar) < 0)
+        audio_ctx->streams[ctx->a_index]->codecpar) < 0)
         ERROR("could not create audio codec context");
 
     LOG("Audio %d chanels, sample rate %dHZ", 
-                   ctx->a_ctx->ch_layout.nb_channels, ctx->a_ctx->sample_rate);
-    LOG("Codec %s ID %d bitrate %ld\n", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
+        ctx->a_ctx->ch_layout.nb_channels, ctx->a_ctx->sample_rate);
+    LOG("Codec %s ID %d bitrate %ld", codec->long_name, codec->id, ctx->v_ctx->bit_rate);
 
     // open the initialized codecs for use
     if (avcodec_open2(ctx->v_ctx, ctx->v_ctx->codec, NULL) < 0)
         ERROR("Could not open video codec");
+    if (avcodec_open2(ctx->a_ctx, ctx->a_ctx->codec, NULL) < 0)
+        ERROR("Could not open audio codec");
      
-
-    // allocate for the packet and frame components
+    // allocate the packets
     ctx->packet = av_packet_alloc();
     if (ctx->packet == NULL)
         ERROR("Could not alloc packet");
+    if (ctx->format_ctx2) {
+        ctx->a_packet = av_packet_alloc();
+        if (ctx->packet == NULL)
+            ERROR("Could not alloc packet");
+    }
 
     ctx->decoding_active = true;
     ctx->video_active = true;
@@ -145,17 +212,26 @@ void init_av_streaming(char *video_file, VideoContext *ctx)
 
 void deinit_av_streaming(VideoContext *ctx)
 {
-    for (int i = 0; i < fqueue.cap; i++)
-        av_frame_free(&fqueue.items[i]);
+    // free frame queue
+    for (int i = 0; i < v_queue.cap; i++)
+        av_frame_free(&v_queue.items[i]);
+
     av_packet_free(&ctx->packet);
     av_frame_free(&ctx->out_frame);
+    avcodec_close(ctx->v_ctx);
+    avcodec_close(ctx->a_ctx);
     avcodec_free_context(&ctx->v_ctx);
     avcodec_free_context(&ctx->a_ctx);
+    avformat_close_input(&ctx->format_ctx);
     avformat_free_context(ctx->format_ctx);
+    if (ctx->format_ctx2) {
+        av_packet_free(&ctx->a_packet);
+        avformat_close_input(&ctx->format_ctx2);
+        avformat_free_context(ctx->format_ctx2);
+    }
     sws_freeContext(ctx->sws_ctx);
 }
 
-// setup conversion
 void init_frame_conversion(VideoContext *ctx)
 {
     enum AVPixelFormat format = ctx->v_ctx->pix_fmt;
@@ -182,17 +258,16 @@ void update_frames(Texture surface, VideoContext *ctx)
     if (ctx->start_time == 0.0) ctx->start_time = GetTime();
     ctx->video_time = GetTime() - ctx->start_time;
 
-    AVFrame *frame = fqueue.items[fqueue.rindex];
+    AVFrame *frame = v_queue.items[v_queue.rindex];
     assert(frame != NULL);
     double next_ts = frame->pts * av_q2d(ctx->v_ctx->time_base);
 
     if (ctx->video_time >= next_ts) {
-        QUEUE_NEXT(fqueue);
+        QUEUE_NEXT(v_queue);
 
         // convert to rgb
         if (frame->data[0] == NULL) ERROR("NULL Frame");
-        sws_scale(ctx->sws_ctx, (const uint8_t *const *)(frame->data), frame->linesize,
-                  0, surface.height, ctx->out_frame->data, ctx->out_frame->linesize);
+        sws_scale_frame(ctx->sws_ctx, ctx->out_frame, frame);
         UpdateTexture(surface, ctx->out_frame->data[0]);
         av_frame_unref(frame);
     }
@@ -211,6 +286,7 @@ bool decode(VideoContext *ctx)
         av_packet_unref(ctx->packet);
         return false;
     }
+    // TODO: Audio with check for is_yt_stream
 
     ret = avcodec_send_packet(ctx->v_ctx, ctx->packet);
     av_packet_unref(ctx->packet);
@@ -219,7 +295,7 @@ bool decode(VideoContext *ctx)
         return false;
     }
     // decoded frame
-    ret = avcodec_receive_frame(ctx->v_ctx, fqueue.items[fqueue.windex]);
+    ret = avcodec_receive_frame(ctx->v_ctx, v_queue.items[v_queue.windex]);
     if (ret == AVERROR(EAGAIN)) return false;
     if (ret == AVERROR_EOF) {
         // Video done
@@ -230,14 +306,14 @@ bool decode(VideoContext *ctx)
         WARN("receiving frame, %s", av_err2str(ret));
         return false;
     }
-    QUEUE_INC(fqueue);
+    QUEUE_INC(v_queue);
 
     return true;
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2) {
+    if (argc != 2) {
         printf("USAGE: %s <input file>\n", argv[0]);
         return 1;
     }
@@ -252,9 +328,10 @@ int main(int argc, char *argv[])
     SetConfigFlags(FLAG_WINDOW_RESIZABLE|FLAG_VSYNC_HINT);
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(DEFAULT_WINDOW_HEIGHT * vid_width / vid_height,
-               DEFAULT_WINDOW_HEIGHT, ctx.format_ctx->url);
+               DEFAULT_WINDOW_HEIGHT, video_file);
     SetWindowMinSize(MIN_WINDOW_HEIGHT * vid_width / vid_height, MIN_WINDOW_HEIGHT);
 
+    // Frame buffer
     Image img = {
         .width = vid_width,
         .height = vid_height,
@@ -266,17 +343,18 @@ int main(int argc, char *argv[])
     SetTextureFilter(surface, TEXTURE_FILTER_BILINEAR);
 
     // frame queue
-    fqueue.items = av_malloc_array(QUEUE_CAP, sizeof(AVFrame *));
-    fqueue.cap = QUEUE_CAP;
-    for (int i = 0; i < fqueue.cap; i++) fqueue.items[i] = av_frame_alloc();
+    v_queue.items = av_malloc_array(FRAME_QUEUE_CAP, sizeof(AVFrame *));
+    v_queue.cap = FRAME_QUEUE_CAP;
+    for (int i = 0; i < v_queue.cap; i++) v_queue.items[i] = av_frame_alloc();
 
-    LOG("PLAYING...");
+    LOG("\nPLAYING...");
     while (!WindowShouldClose()) {
 
         // dont decode frames if queue is full
-        if (ctx.decoding_active && !QUEUE_FULL(fqueue)) {
+        if (ctx.decoding_active && !QUEUE_FULL(v_queue)) {
             if(!decode(&ctx)) continue;
-        } else if (ctx.video_active && !ctx.decoding_active && QUEUE_EMPTY(fqueue)) {
+        } else if (!ctx.decoding_active && ctx.video_active && QUEUE_EMPTY(v_queue)) {
+            // video finished
             deinit_av_streaming(&ctx);
             ctx.video_active = false;
         }
