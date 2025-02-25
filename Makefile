@@ -3,7 +3,7 @@ CFLAGS = -Wextra -Wall -g
 IFLAGS = 
 LFLAGS = -L lib
 LIBS += -lraylib -lm -lavcodec -lavformat -lavutil -lswscale
-LIBS += -lraylib -pthread -ldl -lm -lavcodec -lavformat -lavutil -lswscale
+LIBS += -lraylib -pthread -ldl -lm -lavcodec -lavformat -lavutil -lswscale -lswresample
 
 BUILD_RAYLIB ?= FALSE
 VENDOR_FFMPEG ?= FALSE
