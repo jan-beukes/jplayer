@@ -3,8 +3,10 @@ CFLAGS = -Wextra -Wall -g
 IFLAGS = 
 LFLAGS = -L lib
 LIBS += -lraylib -lm -lavcodec -lavformat -lavutil -lswscale
+LIBS += -lraylib -pthread -ldl -lm -lavcodec -lavformat -lavutil -lswscale
 
 BUILD_RAYLIB ?= TRUE
+BUILD_RAYLIB ?= FALSE
 VENDOR_FFMPEG ?= FALSE
 
 ifeq ($(BUILD_RAYLIB), TRUE)
@@ -31,12 +33,16 @@ ffmpeg:
 		tar -xf lib/ffmpeg/$(FFMPEG_BUILD).tar.xz \
 			--strip-components=1 -C lib/ffmpeg $(FFMPEG_BUILD)/lib $(FFMPEG_BUILD)/include; \
 		rm lib/ffmpeg/$(FFMPEG_BUILD).tar.xz; \
+		echo "#!/bin/sh\nexport LD_LIBRARY_PATH=lib/ffmpeg/lib\nexec ./jplay \$$@" > run.sh; \
 		chmod +x run.sh; \
 	fi
 	echo "#!/bin/sh\nexport LD_LIBRARY_PATH=lib/ffmpeg/lib\nexec ./jplay \$$@" > run.sh;
 
 # RAYLIB
 lib/libraylib.a:
+	@if [ ! -d lib/raylib/src ]; then \
+		echo raylib submodule not found && exit 1; \
+	fi
 	@echo BUILDING RAYLIB...
 	@cd lib/raylib/src && make
 	cp lib/raylib/src/libraylib.a lib

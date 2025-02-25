@@ -267,8 +267,6 @@ void deinit_av_streaming(VideoContext *ctx)
         av_packet_free(&packets.items[i]);
 
     av_frame_free(&ctx->out_frame);
-    avcodec_close(ctx->v_ctx);
-    avcodec_close(ctx->a_ctx);
     avcodec_free_context(&ctx->v_ctx);
     avcodec_free_context(&ctx->a_ctx);
     avformat_close_input(&ctx->format_ctx);
@@ -404,7 +402,7 @@ void start_threads(VideoContext *ctx)
     pthread_detach(decode_thread);
 }
 
-#define USAGE() fprintf(stderr, "USAGE: %s <input file/url>\nyt-dlp: %s [-- OPTIONS] <url>", argv[0], argv[0])
+#define USAGE() fprintf(stderr, "USAGE: %s <input file/url>\nyt-dlp: %s [-- OPTIONS] <url>\n", argv[0], argv[0])
 
 int main(int argc, char *argv[])
 {
