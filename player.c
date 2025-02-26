@@ -73,7 +73,7 @@
 
 typedef struct {
     AVFormatContext *format_ctx;
-    AVFormatContext *format_ctx2; // used for split audio. will be NULL if not split
+    AVFormatContext *format_ctx2; // used for split audio
 
     // Codecs
     AVCodecContext *v_ctx;
@@ -84,10 +84,12 @@ typedef struct {
     AVFrame *out_frame;
     struct SwsContext *sws_ctx;
     AudioStream audio_stream;
+    int a_buffer_size;
     int sample_size;
     SwrContext *swr_ctx;
 
     // state stuff
+    bool is_split;
     bool video_active;
     bool decoding_active;
     bool paused;
@@ -119,6 +121,7 @@ typedef struct PacketQueue {
 
 // Globals
 PacketQueue packets = {0};
+PacketQueue packets2 = {0};
 FrameQueue v_queue = {0};
 FrameQueue a_queue = {0};
 uint8_t *audio_buffer = NULL;
@@ -180,6 +183,7 @@ void init_format_yt(VideoContext *ctx, char *video_file, char *yt_dlp_args)
         if (avformat_find_stream_info(ctx->format_ctx2, NULL) < 0)
             ERROR("Could not find stream info");
     }
+    ctx->is_split = true;
 }
 
 // youtube also has the youtu.be domain
@@ -216,7 +220,7 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 
     // find video stream
     ret = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
-    if (ret < 0 && ctx->format_ctx2) {
+    if (ret < 0 && ctx->is_split) {
         ret = av_find_best_stream(ctx->format_ctx2, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (ret < 0) ERROR("Could not find a video stream");
         // swap so that video is in ctx 1
@@ -241,7 +245,7 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 
     // initialize audio codec
     // if we are using seperated streams then audio must be in context 2
-    AVFormatContext *audio_ctx = ctx->format_ctx2 ? ctx->format_ctx2 : ctx->format_ctx;
+    AVFormatContext *audio_ctx = ctx->is_split ? ctx->format_ctx2 : ctx->format_ctx;
 
     ctx->a_index = av_find_best_stream(audio_ctx, AVMEDIA_TYPE_AUDIO, -1, ctx->v_index, &codec, 0);
     if (ctx->a_index < 0) ERROR("Could not find audio stream");
@@ -283,7 +287,9 @@ void deinit_av_streaming(VideoContext *ctx)
     avcodec_free_context(&ctx->a_ctx);
     avformat_close_input(&ctx->format_ctx);
     avformat_free_context(ctx->format_ctx);
-    if (ctx->format_ctx2) {
+    if (ctx->is_split) {
+        for (int i = 0; i < packets2.cap; i++)
+            av_packet_free(&packets2.items[i]);
         avformat_close_input(&ctx->format_ctx2);
         avformat_free_context(ctx->format_ctx2);
     }
@@ -328,29 +334,31 @@ void *io_thread_func(void *arg)
     while (true) {
         if (IsWindowReady() && WindowShouldClose()) break;
 
-        if (ctx->format_ctx2) {
-            if (QUEUE_FULL(packets)) continue;
+        if (!QUEUE_FULL(packets)) {
             QUEUE_BACK(packets, packet);
-            ret = av_read_frame(ctx->format_ctx2, packet);
-            if (ret == AVERROR_EOF && done) break;
+            ret = av_read_frame(ctx->format_ctx, packet);
+            if (ret == AVERROR_EOF) {
+                done = true;
+            }
             else if (ret < 0) {
                 WARN("reading frame, %s", av_err2str(ret));
             } else {
-                packet->stream_index = ctx->a_index;
                 QUEUE_INC(packets);
             }
-        } else if (done) break;
-
-        QUEUE_BACK(packets, packet);
-        ret = av_read_frame(ctx->format_ctx, packet);
-        if (ret == AVERROR_EOF) done = true;
-        else if (ret < 0) {
-            WARN("reading frame, %s", av_err2str(ret));
-            continue;
-        } else {
-            QUEUE_INC(packets);
         }
-
+        if (ctx->is_split && !QUEUE_FULL(packets2)) {
+            QUEUE_BACK(packets2, packet);
+            ret = av_read_frame(ctx->format_ctx2, packet);
+            if (ret == AVERROR_EOF && done) {
+                break;
+            }
+            else if (ret < 0) {
+                WARN("reading audio frame, %s", av_err2str(ret));
+            } else {
+                packet->stream_index = ctx->a_index;
+                QUEUE_INC(packets2);
+            }
+        } else if (done) break;
     }
     return NULL;
 }
@@ -363,34 +371,55 @@ void *decode_thread_func(void *arg)
 
     while (ctx->decoding_active) {
         if (IsWindowReady() && WindowShouldClose()) break;
-        if (QUEUE_EMPTY(packets)) continue; 
 
         AVPacket *packet;
         packet = QUEUE_PEEK(packets);
-        if (packet->stream_index == ctx->v_index && !QUEUE_FULL(v_queue)) {
-            packet = DEQUEUE(packets);
-            // Video
-            ret = avcodec_send_packet(ctx->v_ctx, packet);
-            av_packet_unref(packet);
-            if (ret != 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
-                WARN("sending video packet, %s", av_err2str(ret));
-                continue;
-            }
-            AVFrame *frame;
-            QUEUE_BACK(v_queue, frame);
-            while((ret = avcodec_receive_frame(ctx->v_ctx, frame)) == 0) {
-                QUEUE_INC(v_queue);
+        if (!QUEUE_EMPTY(packets)) {
+            if (!QUEUE_FULL(v_queue) && packet->stream_index == ctx->v_index) {
+                packet = DEQUEUE(packets);
+                // Video
+                ret = avcodec_send_packet(ctx->v_ctx, packet);
+                av_packet_unref(packet);
+                if (ret != 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
+                    WARN("sending video packet, %s", av_err2str(ret));
+                    continue;
+                }
+                AVFrame *frame;
                 QUEUE_BACK(v_queue, frame);
+                while((ret = avcodec_receive_frame(ctx->v_ctx, frame)) == 0) {
+                    QUEUE_INC(v_queue);
+                    QUEUE_BACK(v_queue, frame);
+                }
+                if (ret == AVERROR_EOF) {
+                    // Video done
+                    video_done = true;
+                } else if (ret != AVERROR(EAGAIN)) {
+                    WARN("receiving video frame, %s", av_err2str(ret));
+                }
+            } else if (!ctx->is_split && !QUEUE_FULL(a_queue) && packet->stream_index == ctx->a_index) {
+                packet = DEQUEUE(packets);
+                ret = avcodec_send_packet(ctx->a_ctx, packet);
+                av_packet_unref(packet);
+                if (ret != 0 && ret != AVERROR_EOF) {
+                    WARN("sending audio packet, %s", av_err2str(ret));
+                    continue;
+                }
+                AVFrame *frame;
+                QUEUE_BACK(a_queue, frame);
+                while((ret = avcodec_receive_frame(ctx->a_ctx, frame)) == 0) {
+                    QUEUE_INC(a_queue);
+                    QUEUE_BACK(a_queue, frame);
+                }
+                if (ret == AVERROR_EOF) {
+                    audio_done = true;
+                } else if (ret != AVERROR(EAGAIN)) {
+                    WARN("receiving audio frame, %s", av_err2str(ret));
+                }
+
             }
-            if (ret == AVERROR_EOF) {
-                // Video done
-                video_done = true;
-            } else if (ret != AVERROR(EAGAIN)) {
-                WARN("receiving video frame, %s", av_err2str(ret));
-            }
-        } else if (packet->stream_index == ctx->a_index && !QUEUE_FULL(a_queue)) {
-            packet = DEQUEUE(packets);
-            // Video
+        }
+        if (ctx->is_split && !QUEUE_EMPTY(packets2) && !QUEUE_FULL(a_queue)) {
+            packet = DEQUEUE(packets2);
             ret = avcodec_send_packet(ctx->a_ctx, packet);
             av_packet_unref(packet);
             if (ret != 0 && ret != AVERROR_EOF) {
@@ -404,13 +433,12 @@ void *decode_thread_func(void *arg)
                 QUEUE_BACK(a_queue, frame);
             }
             if (ret == AVERROR_EOF) {
-                // Video done
                 audio_done = true;
             } else if (ret != AVERROR(EAGAIN)) {
                 WARN("receiving audio frame, %s", av_err2str(ret));
             }
-
         }
+
         if (audio_done && video_done) {
             ctx->decoding_active = false;
             LOG("VIDEO DECODING DONE");
@@ -434,18 +462,14 @@ void start_threads(VideoContext *ctx)
 
 void update_frames(Texture surface, VideoContext *ctx)
 {
-    LOG("%d %d %d", QUEUE_SIZE(packets), QUEUE_SIZE(v_queue), QUEUE_SIZE(a_queue));
+    //LOG("%d %d %d %d", QUEUE_SIZE(packets), QUEUE_SIZE(packets2), QUEUE_SIZE(v_queue), QUEUE_SIZE(a_queue));
     AVFrame *frame;
     if (!QUEUE_EMPTY(a_queue) && IsAudioStreamProcessed(ctx->audio_stream)) {
         frame = DEQUEUE(a_queue);
-        if (!audio_buffer) {
-            int size = frame->nb_samples * ctx->audio_stream.channels * (ctx->audio_stream.sampleSize);
-            audio_buffer = av_malloc(size);
-        }
         swr_convert(ctx->swr_ctx, &audio_buffer, frame->nb_samples,
                               (const uint8_t **)frame->data, frame->nb_samples);
         ctx->audio_clock += frame->nb_samples;
-        UpdateAudioStream(ctx->audio_stream, audio_buffer, frame->nb_samples);
+        UpdateAudioStream(ctx->audio_stream, audio_buffer, ctx->a_buffer_size);
         av_frame_unref(frame);
     }
     if (!QUEUE_EMPTY(v_queue)) {
@@ -471,7 +495,6 @@ void update_frames(Texture surface, VideoContext *ctx)
 void main_loop(VideoContext *ctx, Texture surface)
 {
     PlayAudioStream(ctx->audio_stream);
-    double start = GetTime();
     while (!WindowShouldClose()) {
 
         if (!ctx->decoding_active && ctx->video_active && QUEUE_EMPTY(v_queue)) {
@@ -511,7 +534,6 @@ void main_loop(VideoContext *ctx, Texture surface)
         char *dur_str = get_time_string(buf2, ctx->duration);
         const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
         DrawText(text, x, y, font_size, RAYWHITE);
-        DrawText(TextFormat("%d", (int)(GetTime() - start)), x, y + font_size, font_size, BLUE);
 
         // Pause
         if (ctx->paused) {
@@ -538,7 +560,7 @@ void main_loop(VideoContext *ctx, Texture surface)
             pressed_last_frame = true;
 
         } else if (pressed_last_frame) {
-            int fps = (int)(1 / GetFrameTime());
+            int fps = GetFPS();
             if (++press_frame_count >= fps / 4) {
                 press_frame_count = 0;
                 pressed_last_frame = false;
@@ -592,6 +614,11 @@ int main(int argc, char *argv[])
     packets.cap = PACKET_QUEUE_CAP;
     packets.items = av_malloc_array(PACKET_QUEUE_CAP, sizeof(AVPacket *));
     for (int i = 0; i < packets.cap; i++) packets.items[i] = av_packet_alloc();
+    if (ctx.is_split) {
+        packets2.cap = PACKET_QUEUE_CAP;
+        packets2.items = av_malloc_array(PACKET_QUEUE_CAP, sizeof(AVPacket *));
+        for (int i = 0; i < packets2.cap; i++) packets2.items[i] = av_packet_alloc();
+    }
     // video queue
     v_queue.cap = FRAME_QUEUE_CAP;
     v_queue.items = av_malloc_array(v_queue.cap, sizeof(AVFrame *));
@@ -605,10 +632,11 @@ int main(int argc, char *argv[])
 
     // Initialize raylib
     int vid_width = ctx.v_ctx->width, vid_height = ctx.v_ctx->height;
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE|FLAG_VSYNC_HINT);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(DEFAULT_WINDOW_HEIGHT * vid_width / vid_height,
                DEFAULT_WINDOW_HEIGHT, video_file);
+    SetTargetFPS(144);
     InitAudioDevice();
     SetWindowMinSize(MIN_WINDOW_HEIGHT * vid_width / vid_height, MIN_WINDOW_HEIGHT);
 
@@ -622,11 +650,30 @@ int main(int argc, char *argv[])
     };
     Texture surface = LoadTextureFromImage(img);
     SetTextureFilter(surface, TEXTURE_FILTER_BILINEAR);
+
     ctx.sample_size = 32;
-    SetAudioStreamBufferSizeDefault(1024);
+    AVFrame *f;
+    int samples;
+    // Because of buffer filling issues when frame size is unknown we scan until we find some
+    // consistent value
+    ctx.a_buffer_size = ctx.a_ctx->frame_size;
+    if (!ctx.a_ctx->frame_size) {
+        for (int i = a_queue.rindex; i < a_queue.windex; i++) {
+            f = a_queue.items[i];
+            if (samples == f->nb_samples) {
+                ctx.a_buffer_size = samples;
+                break;
+            }
+            samples = f->nb_samples;
+        }
+    }
+    assert(ctx.a_buffer_size != 0);
+    SetAudioStreamBufferSizeDefault(ctx.a_buffer_size);
     ctx.audio_stream = LoadAudioStream(ctx.a_ctx->sample_rate, ctx.sample_size,
                                        ctx.a_ctx->ch_layout.nb_channels);
     SetAudioStreamVolume(ctx.audio_stream, 0.5f);
+    int size = ctx.a_buffer_size * ctx.audio_stream.channels * (ctx.audio_stream.sampleSize / 8);
+    audio_buffer = av_malloc(size);
     LOG("PLAYING...");
 
     main_loop(&ctx, surface);
