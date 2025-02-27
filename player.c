@@ -5,6 +5,7 @@
 #include <pthread.h>
 
 #include <raylib.h>
+#include <rlgl.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
@@ -14,13 +15,16 @@
 
 #define MIN_WINDOW_HEIGHT 200
 #define DEFAULT_WINDOW_HEIGHT 600
+#define MAX_VOLUME 5.0f
+#define VOLUME_STEP 0.1f
 
 #define TIME_FONT_SCALE 0.04f
-#define PAUSE_FONT_SCALE 0.1f
+#define PAUSE_SCALE 0.1f
 
 #define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
 #define LOG(fmt, ...) printf("LOG: "fmt"\n", ##__VA_ARGS__)
 #define WARN(fmt, ...) printf("WARN: "fmt"\n", ##__VA_ARGS__)
+//#define endl "\n"
 
 // Queue stuff
 #define QUEUE_SIZE(Q) ({ \
@@ -85,6 +89,7 @@ typedef struct {
     struct SwsContext *sws_ctx;
     AudioStream audio_stream;
     int a_buffer_size;
+    float volume;
     int sample_size;
     SwrContext *swr_ctx;
 
@@ -101,7 +106,7 @@ typedef struct {
     double duration;
 } VideoContext;
 
-#define FRAME_QUEUE_CAP 64
+#define FRAME_QUEUE_CAP 32
 typedef struct FrameQueue {
     AVFrame **items;
     int cap;
@@ -110,7 +115,7 @@ typedef struct FrameQueue {
     pthread_mutex_t mutex;
 } FrameQueue;
 
-#define PACKET_QUEUE_CAP 128
+#define PACKET_QUEUE_CAP 64
 typedef struct PacketQueue {
     AVPacket **items;
     int cap;
@@ -173,17 +178,16 @@ void init_format_yt(VideoContext *ctx, char *video_file, char *yt_dlp_args)
         ERROR("Could not open youtube video %s", video_file);
     if (avformat_find_stream_info(ctx->format_ctx, NULL) < 0)
         ERROR("Could not find stream info");
-    LOG("Format %s", ctx->format_ctx->iformat->long_name);
 
     // if two streams were returned open the audio file into format_ctx2
     if (ret != NULL) {
         ctx->format_ctx2 = avformat_alloc_context();
+        ctx->is_split = true;
         if (avformat_open_input(&ctx->format_ctx2, url_buf2, NULL, NULL) != 0)
             ERROR("Could not open youtube video %s", video_file);
         if (avformat_find_stream_info(ctx->format_ctx2, NULL) < 0)
             ERROR("Could not find stream info");
     }
-    ctx->is_split = true;
 }
 
 // youtube also has the youtu.be domain
@@ -208,11 +212,12 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
         if (avformat_open_input(&ctx->format_ctx, video_file, NULL, NULL) != 0)
             ERROR("Could not open video file %s", video_file);
 
-        LOG("Format %s", ctx->format_ctx->iformat->long_name);
         // find the streams in the format
         if (avformat_find_stream_info(ctx->format_ctx, NULL) < 0)
             ERROR("Could not find stream info");
     }
+    LOG("Format %s%s", ctx->format_ctx->iformat->long_name,
+        ctx->is_split ? " | split stream" : "");
 
     //---Codecs---
     int ret;
@@ -346,10 +351,12 @@ void *io_thread_func(void *arg)
                 QUEUE_INC(packets);
             }
         }
-        if (ctx->is_split && !QUEUE_FULL(packets2)) {
+        if (ctx->is_split) {
+            if (QUEUE_FULL(packets2)) continue;
             QUEUE_BACK(packets2, packet);
             ret = av_read_frame(ctx->format_ctx2, packet);
             if (ret == AVERROR_EOF && done) {
+                LOG("AUDIO_DONE");
                 break;
             }
             else if (ret < 0) {
@@ -363,80 +370,51 @@ void *io_thread_func(void *arg)
     return NULL;
 }
 
+void decode(AVPacket *packet, FrameQueue *queue, AVCodecContext *codec_ctx, bool *done)
+{
+    // Video
+    int ret;
+    ret = avcodec_send_packet(codec_ctx, packet);
+    if (ret != 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
+        WARN("sending packet, %s", av_err2str(ret));
+        return;
+    }
+    AVFrame *frame;
+    QUEUE_BACK((*queue), frame);
+    while(!QUEUE_FULL((*queue)) && (ret = avcodec_receive_frame(codec_ctx, frame)) == 0) {
+        QUEUE_INC((*queue));
+        QUEUE_BACK((*queue), frame);
+    }
+    if (ret == AVERROR_EOF) {
+        // Video done
+        *done = true;
+    } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+        WARN("receiving frame, %s", av_err2str(ret));
+    }
+}
+
 void *decode_thread_func(void *arg)
 {
     VideoContext *ctx = (VideoContext *)arg;
-    int ret;
     bool video_done = false, audio_done = false;
 
     while (ctx->decoding_active) {
         if (IsWindowReady() && WindowShouldClose()) break;
 
         AVPacket *packet;
-        packet = QUEUE_PEEK(packets);
         if (!QUEUE_EMPTY(packets)) {
+            packet = QUEUE_PEEK(packets);
             if (!QUEUE_FULL(v_queue) && packet->stream_index == ctx->v_index) {
                 packet = DEQUEUE(packets);
-                // Video
-                ret = avcodec_send_packet(ctx->v_ctx, packet);
-                av_packet_unref(packet);
-                if (ret != 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
-                    WARN("sending video packet, %s", av_err2str(ret));
-                    continue;
-                }
-                AVFrame *frame;
-                QUEUE_BACK(v_queue, frame);
-                while((ret = avcodec_receive_frame(ctx->v_ctx, frame)) == 0) {
-                    QUEUE_INC(v_queue);
-                    QUEUE_BACK(v_queue, frame);
-                }
-                if (ret == AVERROR_EOF) {
-                    // Video done
-                    video_done = true;
-                } else if (ret != AVERROR(EAGAIN)) {
-                    WARN("receiving video frame, %s", av_err2str(ret));
-                }
+                decode(packet, &v_queue, ctx->v_ctx, &video_done);
             } else if (!ctx->is_split && !QUEUE_FULL(a_queue) && packet->stream_index == ctx->a_index) {
                 packet = DEQUEUE(packets);
-                ret = avcodec_send_packet(ctx->a_ctx, packet);
-                av_packet_unref(packet);
-                if (ret != 0 && ret != AVERROR_EOF) {
-                    WARN("sending audio packet, %s", av_err2str(ret));
-                    continue;
-                }
-                AVFrame *frame;
-                QUEUE_BACK(a_queue, frame);
-                while((ret = avcodec_receive_frame(ctx->a_ctx, frame)) == 0) {
-                    QUEUE_INC(a_queue);
-                    QUEUE_BACK(a_queue, frame);
-                }
-                if (ret == AVERROR_EOF) {
-                    audio_done = true;
-                } else if (ret != AVERROR(EAGAIN)) {
-                    WARN("receiving audio frame, %s", av_err2str(ret));
-                }
-
+                decode(packet, &a_queue, ctx->a_ctx, &audio_done);
             }
         }
         if (ctx->is_split && !QUEUE_EMPTY(packets2) && !QUEUE_FULL(a_queue)) {
             packet = DEQUEUE(packets2);
-            ret = avcodec_send_packet(ctx->a_ctx, packet);
-            av_packet_unref(packet);
-            if (ret != 0 && ret != AVERROR_EOF) {
-                WARN("sending audio packet, %s", av_err2str(ret));
-                continue;
-            }
-            AVFrame *frame;
-            QUEUE_BACK(a_queue, frame);
-            while((ret = avcodec_receive_frame(ctx->a_ctx, frame)) == 0) {
-                QUEUE_INC(a_queue);
-                QUEUE_BACK(a_queue, frame);
-            }
-            if (ret == AVERROR_EOF) {
-                audio_done = true;
-            } else if (ret != AVERROR(EAGAIN)) {
-                WARN("receiving audio frame, %s", av_err2str(ret));
-            }
+            decode(packet, &a_queue, ctx->a_ctx, &audio_done);
         }
 
         if (audio_done && video_done) {
@@ -465,21 +443,28 @@ void update_frames(Texture surface, VideoContext *ctx)
     //LOG("%d %d %d %d", QUEUE_SIZE(packets), QUEUE_SIZE(packets2), QUEUE_SIZE(v_queue), QUEUE_SIZE(a_queue));
     AVFrame *frame;
     if (!QUEUE_EMPTY(a_queue) && IsAudioStreamProcessed(ctx->audio_stream)) {
-        frame = DEQUEUE(a_queue);
-        swr_convert(ctx->swr_ctx, &audio_buffer, frame->nb_samples,
+        pthread_mutex_lock(&a_queue.mutex);
+        frame = a_queue.items[a_queue.rindex];
+        a_queue.rindex = (a_queue.rindex + 1) % a_queue.cap;
+
+        swr_convert(ctx->swr_ctx, &audio_buffer, ctx->a_buffer_size,
                               (const uint8_t **)frame->data, frame->nb_samples);
+
         ctx->audio_clock += frame->nb_samples;
-        UpdateAudioStream(ctx->audio_stream, audio_buffer, ctx->a_buffer_size);
+        UpdateAudioStream(ctx->audio_stream, audio_buffer, frame->nb_samples);
         av_frame_unref(frame);
+        pthread_mutex_unlock(&a_queue.mutex);
     }
     if (!QUEUE_EMPTY(v_queue)) {
-        frame = QUEUE_PEEK(v_queue);
+        pthread_mutex_lock(&v_queue.mutex);
+        frame = v_queue.items[v_queue.rindex];
         assert(frame != NULL);
         double next_ts = frame->pts * av_q2d(ctx->v_ctx->time_base);
         double audio_time = (double)ctx->audio_clock / ctx->audio_stream.sampleRate;
         if (audio_time >= next_ts) {
             ctx->video_clock = frame->pts;
-            DEQUEUE(v_queue);
+            v_queue.rindex = (v_queue.rindex + 1) % v_queue.cap;
+            pthread_mutex_unlock(&v_queue.mutex);
 
             // convert to rgb and update video
             if (frame->data[0] == NULL) ERROR("NULL Frame");
@@ -487,8 +472,43 @@ void update_frames(Texture surface, VideoContext *ctx)
             UpdateTexture(surface, ctx->out_frame->data[0]);
 
             av_frame_unref(frame);
+        } else {
+            pthread_mutex_unlock(&v_queue.mutex);
         }
     } 
+
+}
+
+void render_ui(VideoContext *ctx, Rectangle rect)
+{
+    int screen_width = GetScreenWidth(), screen_height = GetScreenHeight();
+    //---UI-OVERLAY---
+    float font_size = rect.height * TIME_FONT_SCALE;
+
+    // Time
+    int current_time = ctx->audio_clock / ctx->audio_stream.sampleRate;
+    char buf1[128], buf2[128];
+    char *cur_time_str = get_time_string(buf1, current_time);
+    char *dur_str = get_time_string(buf2, ctx->duration);
+    const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
+    DrawText(text, rect.x, rect.y, font_size, RAYWHITE);
+
+    // Volume
+    text = TextFormat("%.1f", ctx->volume);
+    DrawText(text, rect.x, screen_height - font_size, font_size, GREEN);
+
+    // Pause
+    if (ctx->paused) {
+        float pause_height = rect.height * PAUSE_SCALE;
+        float pause_width = pause_height * 0.25;
+        int y = (screen_height - pause_height) / 2;
+        int x = screen_width / 2 - 2*(int)pause_width;
+        DrawRectangle(x, y, pause_width, pause_height, RAYWHITE);
+        DrawRectangleLines(x, y, pause_width, pause_height, BLACK);
+        x += 2*pause_width;
+        DrawRectangle(x, y, pause_width, pause_height, RAYWHITE);
+        DrawRectangleLines(x, y, pause_width, pause_height, BLACK);
+    }
 
 }
 
@@ -506,6 +526,36 @@ void main_loop(VideoContext *ctx, Texture surface)
         if (!ctx->paused && ctx->video_active)
             update_frames(surface, ctx);
 
+        // Events
+        if (IsKeyPressed(KEY_SPACE)) {
+            ctx->paused = !ctx->paused;
+        }
+        float scroll = GetMouseWheelMoveV().y;
+        if (IsKeyPressed(KEY_UP) || scroll > 0.0f) {
+            ctx->volume += VOLUME_STEP;
+            ctx->volume = ctx->volume > MAX_VOLUME ? MAX_VOLUME : ctx->volume;
+            SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+        } else if (IsKeyPressed(KEY_DOWN) || scroll < 0.0f) {
+            ctx->volume -= VOLUME_STEP;
+            ctx->volume = ctx->volume < 0.0f ? 0.0f : ctx->volume;
+            SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+        }
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            if (pressed_last_frame) {
+                if (IsWindowState(FLAG_WINDOW_MAXIMIZED))
+                    ClearWindowState(FLAG_WINDOW_MAXIMIZED);
+                else
+                    SetWindowState(FLAG_WINDOW_MAXIMIZED);
+            }
+            pressed_last_frame = true;
+
+        } else if (pressed_last_frame) {
+            int fps = GetFPS();
+            if (++press_frame_count >= fps / 4) {
+                press_frame_count = 0;
+                pressed_last_frame = false;
+            }
+        }
         // Rendering
         ClearBackground(BLACK);
 
@@ -525,47 +575,9 @@ void main_loop(VideoContext *ctx, Texture surface)
         if (ctx->video_active)
             DrawTexturePro(surface, src, dst, (Vector2){0}, 0, WHITE);
 
-        //---UI-OVERLAY---
-        float font_size = height * TIME_FONT_SCALE;
-        // Time
-        int current_time = ctx->audio_clock / ctx->audio_stream.sampleRate;
-        char buf1[128], buf2[128];
-        char *cur_time_str = get_time_string(buf1, current_time);
-        char *dur_str = get_time_string(buf2, ctx->duration);
-        const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
-        DrawText(text, x, y, font_size, RAYWHITE);
-
-        // Pause
-        if (ctx->paused) {
-            font_size = height * PAUSE_FONT_SCALE;
-            text = TextFormat("Paused");
-            int text_width = MeasureText(text, font_size);
-            x = (screen_width - text_width) / 2, y = (screen_height - (int)font_size) / 2;
-            DrawText(text, x, y, font_size, RED);
-        }
+        render_ui(ctx, dst);
 
         EndDrawing();
-
-        // Events
-        if (IsKeyPressed(KEY_SPACE)) {
-            ctx->paused = !ctx->paused;
-        }
-        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-            if (pressed_last_frame) {
-                if (IsWindowState(FLAG_WINDOW_MAXIMIZED))
-                    ClearWindowState(FLAG_WINDOW_MAXIMIZED);
-                else
-                    SetWindowState(FLAG_WINDOW_MAXIMIZED);
-            }
-            pressed_last_frame = true;
-
-        } else if (pressed_last_frame) {
-            int fps = GetFPS();
-            if (++press_frame_count >= fps / 4) {
-                press_frame_count = 0;
-                pressed_last_frame = false;
-            }
-        }
 
     }
 
@@ -636,7 +648,7 @@ int main(int argc, char *argv[])
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(DEFAULT_WINDOW_HEIGHT * vid_width / vid_height,
                DEFAULT_WINDOW_HEIGHT, video_file);
-    SetTargetFPS(144);
+    SetTargetFPS(120);
     InitAudioDevice();
     SetWindowMinSize(MIN_WINDOW_HEIGHT * vid_width / vid_height, MIN_WINDOW_HEIGHT);
 
@@ -651,27 +663,25 @@ int main(int argc, char *argv[])
     Texture surface = LoadTextureFromImage(img);
     SetTextureFilter(surface, TEXTURE_FILTER_BILINEAR);
 
+    //---Audio---
     ctx.sample_size = 32;
     AVFrame *f;
-    int samples;
-    // Because of buffer filling issues when frame size is unknown we scan until we find some
-    // consistent value
+
+    // Because of buffer filling issues when frame size is unknown we scan the frames for a value
     ctx.a_buffer_size = ctx.a_ctx->frame_size;
     if (!ctx.a_ctx->frame_size) {
         for (int i = a_queue.rindex; i < a_queue.windex; i++) {
             f = a_queue.items[i];
-            if (samples == f->nb_samples) {
-                ctx.a_buffer_size = samples;
-                break;
-            }
-            samples = f->nb_samples;
+            ctx.a_buffer_size = f->nb_samples > ctx.a_buffer_size ? f->nb_samples : ctx.a_buffer_size;
         }
     }
     assert(ctx.a_buffer_size != 0);
     SetAudioStreamBufferSizeDefault(ctx.a_buffer_size);
     ctx.audio_stream = LoadAudioStream(ctx.a_ctx->sample_rate, ctx.sample_size,
                                        ctx.a_ctx->ch_layout.nb_channels);
-    SetAudioStreamVolume(ctx.audio_stream, 0.5f);
+    ctx.volume = 1.0f;
+    SetAudioStreamVolume(ctx.audio_stream, ctx.volume);
+
     int size = ctx.a_buffer_size * ctx.audio_stream.channels * (ctx.audio_stream.sampleSize / 8);
     audio_buffer = av_malloc(size);
     LOG("PLAYING...");

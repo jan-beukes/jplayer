@@ -1,6 +1,7 @@
 # TODO
+FIX!
+
 - [x] yt-dlp integration
 - [x] Audio
-- [ ] Fix crazy bugs
-- [ ] audio control
+- [x] audio control
 - [ ] seeking
