@@ -5,7 +5,6 @@
 #include <pthread.h>
 
 #include <raylib.h>
-#include <rlgl.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
@@ -98,6 +97,7 @@ typedef struct {
     bool video_active;
     bool decoding_active;
     bool paused;
+    bool muted;
 
     // clock
     int64_t video_clock;
@@ -491,9 +491,12 @@ void render_ui(VideoContext *ctx, Rectangle rect)
     char *cur_time_str = get_time_string(buf1, current_time);
     char *dur_str = get_time_string(buf2, ctx->duration);
     const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
+    int text_width = MeasureText(text, font_size);
+    DrawRectangle(rect.x, rect.y, text_width, font_size, (Color){0, 0, 0, 100});
     DrawText(text, rect.x, rect.y, font_size, RAYWHITE);
 
     // Volume
+    // TODO: icon
     text = TextFormat("%.1f", ctx->volume);
     DrawText(text, rect.x, screen_height - font_size, font_size, GREEN);
 
@@ -539,6 +542,13 @@ void main_loop(VideoContext *ctx, Texture surface)
             ctx->volume -= VOLUME_STEP;
             ctx->volume = ctx->volume < 0.0f ? 0.0f : ctx->volume;
             SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+        }
+        if (IsKeyPressed(KEY_M)) {
+            if (ctx->muted)
+                SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+            else
+                SetAudioStreamVolume(ctx->audio_stream, 0.0f);
+            ctx->muted = !ctx->muted;
         }
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             if (pressed_last_frame) {
