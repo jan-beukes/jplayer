@@ -35,7 +35,7 @@ ffmpeg:
 		echo "#!/bin/sh\nexport LD_LIBRARY_PATH=lib/ffmpeg/lib\nexec ./jplay \$$@" > run.sh; \
 		chmod +x run.sh; \
 	fi
-	echo "#!/bin/sh\nexport LD_LIBRARY_PATH=lib/ffmpeg/lib\nexec ./jplay \$$@" > run.sh;
+	@echo "#!/bin/sh\nexport LD_LIBRARY_PATH=lib/ffmpeg/lib\nexec ./jplay \$$@" > run.sh;
 
 # RAYLIB
 lib/libraylib.a:

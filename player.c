@@ -21,8 +21,8 @@
 #define PAUSE_SCALE 0.1f
 
 #define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
-#define LOG(fmt, ...) printf("LOG: "fmt"\n", ##__VA_ARGS__)
-#define WARN(fmt, ...) printf("WARN: "fmt"\n", ##__VA_ARGS__)
+#define LOG(fmt, ...) ({ if (!quiet) printf("LOG: "fmt"\n", ##__VA_ARGS__); })
+#define WARN(fmt, ...) ({ if (!quiet) printf("WARN: "fmt"\n", ##__VA_ARGS__); })
 //#define endl "\n"
 
 // Queue stuff
@@ -134,6 +134,9 @@ uint8_t *audio_buffer = NULL;
 bool pressed_last_frame = false;
 int press_frame_count = 0;
 
+// flags
+bool quiet = false;
+
 char *get_time_string(char *buf, int seconds)
 {
     if (seconds < 60*60) {
@@ -204,7 +207,7 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
         if (strncmp(video_file, domains[i], strlen(domains[i])) == 0)
             yt_url = true;
     }
-    if (yt_url) {
+    if (yt_url || yt_dlp_args != NULL) {
         init_format_yt(ctx, video_file, yt_dlp_args);
     } else {
         ctx->format_ctx = avformat_alloc_context();
@@ -356,7 +359,6 @@ void *io_thread_func(void *arg)
             QUEUE_BACK(packets2, packet);
             ret = av_read_frame(ctx->format_ctx2, packet);
             if (ret == AVERROR_EOF && done) {
-                LOG("AUDIO_DONE");
                 break;
             }
             else if (ret < 0) {
@@ -593,43 +595,60 @@ void main_loop(VideoContext *ctx, Texture surface)
 
 }
 
-#define USAGE() fprintf(stderr, "USAGE: %s <input file/url>\nyt-dlp: %s [-- OPTIONS] <url>\n", argv[0], argv[0])
+#define USAGE() fprintf(stderr, \
+"USAGE: %s [OPTIONS] <input file/url>\n" \
+"yt-dlp: %s [-- [yt-dlp options]] <url>\n\n" \
+"Options:\n" \
+"-q\tquite\n" \
+, argv[0], argv[0])
+
+// return video file
+char *parse_args(int argc, char *argv[], char **yt_dlp)
+{
+    static char yt_dlp_buf[1024];
+    //---Arguments---
+    if (argc < 2) {
+        USAGE();
+        exit(1);
+    }
+    *yt_dlp = NULL;
+    // parse flags
+    if (argc >= 3) {
+        for (int i = 1; i < argc - 1; i++) {
+            char *arg = argv[i];
+            // yt-dlp args
+            if (strcmp(arg, "--") == 0) {
+                for (i++; i < argc - 1; i++) {
+                    size_t len = strlen(yt_dlp_buf);
+                    if (len < 1023) {
+                        yt_dlp_buf[len] = ' ';
+                        yt_dlp_buf[len + 1] = '\0';
+                    }
+                    size_t n = 1024 - len;
+                    strncat(yt_dlp_buf, argv[i], n);
+                }
+                *yt_dlp = yt_dlp_buf;
+            } else if (strcmp(arg, "-q") == 0) {
+                quiet = true;
+            } else {
+                USAGE();
+                exit(1);
+            }
+        }
+    }
+char *video_file = argv[argc - 1];
+    return video_file;
+}
 
 int main(int argc, char *argv[])
 {
-    //---Arguments---
-    if (argc < 2 || argc == 3) {
-        USAGE();
-        return 1;
-    }
     char *video_file;
-    char yt_dlp_buf[1024];
-    char *yt_dlp_args = NULL;
-    if (argc > 3) {
-        char *sep = argv[1];
-        if (strcmp(sep, "--") != 0) {
-            USAGE();
-            return 1;
-        }
-        strncpy(yt_dlp_buf, argv[2], 1024);
-        for (int i = 3; i < argc - 1; i++) {
-            size_t len = strlen(yt_dlp_buf);
-            if (len < 1023) {
-                yt_dlp_buf[len] = ' ';
-                yt_dlp_buf[len + 1] = '\0';
-            }
-            size_t n = 1024 - len;
-            strncat(yt_dlp_buf, argv[i], n);
-        }
-        video_file = argv[argc - 1];
-        yt_dlp_args = yt_dlp_buf;
-    } else {
-        video_file = argv[1];
-    }
+    char *yt_dlp = NULL;
+    video_file = parse_args(argc, argv, &yt_dlp);
 
     // Initialization
     VideoContext ctx = {0};
-    init_av_streaming(&ctx, video_file, yt_dlp_args);
+    init_av_streaming(&ctx, video_file, yt_dlp);
     init_frame_conversion(&ctx);
 
     // packets
