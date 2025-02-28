@@ -6,7 +6,7 @@ libraries
 **Dependencies**
 - ffmpeg / libav
 - raylib
-- yt-dlp (optional)
+- yt-dlp (optional for youtube streaming)
 
 ```
 git clone --recurse-submodules https://github.com/jan-beukes/jplayer.git
@@ -14,10 +14,9 @@ cd jplayer
 make BUILD_RAYLIB=TRUE VENDOR_FFMPEG=FALSE
 ```
 
-
 ## Usage
 ```
-jplay <video file/url>
+jplay [OPTIONS] <video file/url>
 ```
 If yt-dlp is in PATH
 ```

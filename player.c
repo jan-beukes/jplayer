@@ -17,7 +17,8 @@
 #define MAX_VOLUME 5.0f
 #define VOLUME_STEP 0.1f
 
-#define TIME_FONT_SCALE 0.04f
+#define TIME_FONT_SCALE 0.03f
+#define VOLUME_BAR_SCALE 0.1f
 #define PAUSE_SCALE 0.1f
 
 #define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
@@ -156,7 +157,7 @@ char *get_time_string(char *buf, int seconds)
  
 // initialize format context from youtube url
 #define BUF_MAX_LEN 2048
-#define DEFAULT_ARGS "-f 'b*[height<=1080]+ba'"
+#define DEFAULT_ARGS "-f \"b*[height<=1080]+ba\""
 void init_format_yt(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 {
     LOG("initializing youtube streaming...");
@@ -198,8 +199,6 @@ void init_format_yt(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 {
     av_log_set_level(AV_LOG_ERROR);
-    LOG("LOADING VIDEO");
-
     //---Format---
     bool yt_url = false;
     const char *domains[] = YT_DOMAINS;
@@ -210,6 +209,7 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
     if (yt_url || yt_dlp_args != NULL) {
         init_format_yt(ctx, video_file, yt_dlp_args);
     } else {
+        LOG("Loading Video");
         ctx->format_ctx = avformat_alloc_context();
         // allocate format context and read format from file
         if (avformat_open_input(&ctx->format_ctx, video_file, NULL, NULL) != 0)
@@ -316,7 +316,7 @@ void init_frame_conversion(VideoContext *ctx)
     enum AVPixelFormat format = ctx->v_ctx->pix_fmt;
     int vid_width = ctx->v_ctx->width, vid_height = ctx->v_ctx->height;
     ctx->sws_ctx = sws_getContext(vid_width, vid_height, format, 
-                                                vid_width, vid_height, AV_PIX_FMT_RGB24,
+                                                vid_width, vid_height, AV_PIX_FMT_RGBA,
                                                 SWS_BILINEAR, NULL, NULL, NULL);
     if (ctx->sws_ctx == NULL)
         ERROR("Failed to get sws context");
@@ -360,8 +360,7 @@ void *io_thread_func(void *arg)
             ret = av_read_frame(ctx->format_ctx2, packet);
             if (ret == AVERROR_EOF && done) {
                 break;
-            }
-            else if (ret < 0) {
+            } else if (ret < 0 && ret != AVERROR_EOF) {
                 WARN("reading audio frame, %s", av_err2str(ret));
             } else {
                 packet->stream_index = ctx->a_index;
@@ -486,6 +485,7 @@ void render_ui(VideoContext *ctx, Rectangle rect)
     int screen_width = GetScreenWidth(), screen_height = GetScreenHeight();
     //---UI-OVERLAY---
     float font_size = rect.height * TIME_FONT_SCALE;
+    Color faded_black = {0, 0, 0, 100};
 
     // Time
     int current_time = ctx->audio_clock / ctx->audio_stream.sampleRate;
@@ -494,13 +494,25 @@ void render_ui(VideoContext *ctx, Rectangle rect)
     char *dur_str = get_time_string(buf2, ctx->duration);
     const char *text = TextFormat("%s/%s", cur_time_str, dur_str);
     int text_width = MeasureText(text, font_size);
-    DrawRectangle(rect.x, rect.y, text_width, font_size, (Color){0, 0, 0, 100});
-    DrawText(text, rect.x, rect.y, font_size, RAYWHITE);
+    float bottom = rect.y + rect.height;
+    float right = rect.x + rect.width;
+    DrawRectangle(right - text_width, bottom - font_size, text_width, font_size, faded_black);
+    DrawText(text, right - text_width, bottom - font_size, font_size, RAYWHITE);
 
     // Volume
     // TODO: icon
-    text = TextFormat("%.1f", ctx->volume);
-    DrawText(text, rect.x, screen_height - font_size, font_size, GREEN);
+    float padding = font_size*0.2f;
+    float max_width = rect.width * VOLUME_BAR_SCALE;
+    Rectangle volume_bar = {rect.x, bottom - font_size, max_width, font_size};
+    DrawRectangleRounded(volume_bar, 0.4f, 20, faded_black);
+    volume_bar = (Rectangle){
+        .x = rect.x + padding,
+        .y = bottom - font_size + padding,
+        .width = (ctx->volume / MAX_VOLUME) * max_width - 2*padding,
+        .height = font_size - 2*padding
+    };
+    Color color = ctx->muted ? GRAY : RAYWHITE;
+    DrawRectangleRounded(volume_bar, 0.4f, 20, color);
 
     // Pause
     if (ctx->paused) {
@@ -521,6 +533,7 @@ void main_loop(VideoContext *ctx, Texture surface)
 {
     PlayAudioStream(ctx->audio_stream);
     while (!WindowShouldClose()) {
+        //float dt = GetFrameTime();
 
         if (!ctx->decoding_active && ctx->video_active && QUEUE_EMPTY(v_queue)) {
             // video finished
@@ -537,11 +550,13 @@ void main_loop(VideoContext *ctx, Texture surface)
         }
         float scroll = GetMouseWheelMoveV().y;
         if (IsKeyPressed(KEY_UP) || scroll > 0.0f) {
-            ctx->volume += VOLUME_STEP;
+            float step = scroll ? VOLUME_STEP : VOLUME_STEP * 4.0f;
+            ctx->volume += step;
             ctx->volume = ctx->volume > MAX_VOLUME ? MAX_VOLUME : ctx->volume;
             SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
         } else if (IsKeyPressed(KEY_DOWN) || scroll < 0.0f) {
-            ctx->volume -= VOLUME_STEP;
+            float step = scroll ? VOLUME_STEP : VOLUME_STEP * 4.0f;
+            ctx->volume -= step;
             ctx->volume = ctx->volume < 0.0f ? 0.0f : ctx->volume;
             SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
         }
@@ -686,7 +701,7 @@ int main(int argc, char *argv[])
         .width = vid_width,
         .height = vid_height,
         .mipmaps = 1,        
-        .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8,
+        .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
         .data = ctx.out_frame->data[0],
     };
     Texture surface = LoadTextureFromImage(img);
