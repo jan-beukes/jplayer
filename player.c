@@ -14,8 +14,8 @@
 
 #define MIN_WINDOW_HEIGHT 200
 #define DEFAULT_WINDOW_HEIGHT 600
-#define MAX_VOLUME 5.0f
-#define VOLUME_STEP 0.1f
+#define MAX_VOLUME 4.0f
+#define VOLUME_STEP 0.05f
 
 #define TIME_FONT_SCALE 0.03f
 #define VOLUME_BAR_SCALE 0.1f
@@ -97,6 +97,7 @@ typedef struct {
     bool is_split;
     bool video_active;
     bool decoding_active;
+    bool io_active;
     bool paused;
     bool muted;
 
@@ -196,6 +197,7 @@ void init_format_yt(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 
 // youtube also has the youtu.be domain
 #define YT_DOMAINS {"https://www.youtu", "https://youtu", "youtu"}
+// TODO: parse url for timestamp to seek to
 void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
 {
     av_log_set_level(AV_LOG_ERROR);
@@ -274,8 +276,6 @@ void init_av_streaming(VideoContext *ctx, char *video_file, char *yt_dlp_args)
     if (avcodec_open2(ctx->a_ctx, ctx->a_ctx->codec, NULL) < 0)
         ERROR("Could not open audio codec");
      
-    ctx->decoding_active = true;
-    ctx->video_active = true;
     return;
 }
 
@@ -316,13 +316,21 @@ void init_frame_conversion(VideoContext *ctx)
     enum AVPixelFormat format = ctx->v_ctx->pix_fmt;
     int vid_width = ctx->v_ctx->width, vid_height = ctx->v_ctx->height;
     ctx->sws_ctx = sws_getContext(vid_width, vid_height, format, 
-                                                vid_width, vid_height, AV_PIX_FMT_RGBA,
+                                                vid_width, vid_height, AV_PIX_FMT_RGB24,
                                                 SWS_BILINEAR, NULL, NULL, NULL);
     if (ctx->sws_ctx == NULL)
         ERROR("Failed to get sws context");
+
     ctx->out_frame = av_frame_alloc();
     ctx->out_frame->width = vid_width;
     ctx->out_frame->height = vid_height;
+    ctx->out_frame->format = AV_PIX_FMT_RGB24;
+    // allocate the image data and make sure the data is alligned to 1 byte
+    if (av_image_alloc(ctx->out_frame->data, ctx->out_frame->linesize,
+                       ctx->out_frame->width, ctx->out_frame->height,
+                       ctx->out_frame->format, 1) < 0) {
+        ERROR("Failed to allocate image buffer\n");
+    }
 
     // Sample conversion
     ret = swr_alloc_set_opts2(&ctx->swr_ctx, &ctx->a_ctx->ch_layout, AV_SAMPLE_FMT_FLT,
@@ -368,6 +376,7 @@ void *io_thread_func(void *arg)
             }
         } else if (done) break;
     }
+    ctx->io_active = false;
     return NULL;
 }
 
@@ -412,6 +421,10 @@ void *decode_thread_func(void *arg)
                 packet = DEQUEUE(packets);
                 decode(packet, &a_queue, ctx->a_ctx, &audio_done);
             }
+        } else if (!ctx->io_active) {
+            ctx->decoding_active = false;
+            LOG("VIDEO DECODING DONE");
+            break;
         }
         if (ctx->is_split && !QUEUE_EMPTY(packets2) && !QUEUE_FULL(a_queue)) {
             packet = DEQUEUE(packets2);
@@ -424,6 +437,7 @@ void *decode_thread_func(void *arg)
             break;
         }
     }
+    LOG("DONE");
     return NULL;
 }
 
@@ -437,10 +451,20 @@ void start_threads(VideoContext *ctx)
     pthread_create(&decode_thread, NULL, decode_thread_func, ctx);
     pthread_detach(io_thread);
     pthread_detach(decode_thread);
+
+    ctx->decoding_active = true;
+    ctx->video_active = true;
+    ctx->io_active = true;
 }
 
 void update_frames(Texture surface, VideoContext *ctx)
 {
+    // video finished
+    if (!ctx->decoding_active && ctx->video_active && QUEUE_EMPTY(v_queue)) {
+        ctx->video_active = false;
+        return;
+    }
+
     //LOG("%d %d %d %d", QUEUE_SIZE(packets), QUEUE_SIZE(packets2), QUEUE_SIZE(v_queue), QUEUE_SIZE(a_queue));
     AVFrame *frame;
     if (!QUEUE_EMPTY(a_queue) && IsAudioStreamProcessed(ctx->audio_stream)) {
@@ -488,6 +512,7 @@ void render_ui(VideoContext *ctx, Rectangle rect)
     Color faded_black = {0, 0, 0, 100};
 
     // Time
+    float padding = font_size*0.2f;
     int current_time = ctx->audio_clock / ctx->audio_stream.sampleRate;
     char buf1[128], buf2[128];
     char *cur_time_str = get_time_string(buf1, current_time);
@@ -496,12 +521,14 @@ void render_ui(VideoContext *ctx, Rectangle rect)
     int text_width = MeasureText(text, font_size);
     float bottom = rect.y + rect.height;
     float right = rect.x + rect.width;
-    DrawRectangle(right - text_width, bottom - font_size, text_width, font_size, faded_black);
+    Rectangle time_rect = {right - text_width - padding, bottom - font_size - padding,
+        text_width + 2*padding, font_size + 2*padding};
+    DrawRectangleRounded(time_rect, 0.4f, 20, faded_black);
     DrawText(text, right - text_width, bottom - font_size, font_size, RAYWHITE);
 
     // Volume
     // TODO: icon
-    float padding = font_size*0.2f;
+    font_size *= 0.8f;
     float max_width = rect.width * VOLUME_BAR_SCALE;
     Rectangle volume_bar = {rect.x, bottom - font_size, max_width, font_size};
     DrawRectangleRounded(volume_bar, 0.4f, 20, faded_black);
@@ -527,6 +554,15 @@ void render_ui(VideoContext *ctx, Rectangle rect)
         DrawRectangleLines(x, y, pause_width, pause_height, BLACK);
     }
 
+    if (!ctx->video_active) {
+        float font_size = rect.height * PAUSE_SCALE;
+        const char *text = TextFormat("Restart?");
+        int width = MeasureText(text, font_size);
+        int x = rect.x + (rect.width - width) / 2;
+        int y = rect.y + (rect.height - font_size) / 2;
+        DrawText(text, x, y, font_size, RAYWHITE);
+    }
+
 }
 
 void main_loop(VideoContext *ctx, Texture surface)
@@ -535,30 +571,28 @@ void main_loop(VideoContext *ctx, Texture surface)
     while (!WindowShouldClose()) {
         //float dt = GetFrameTime();
 
-        if (!ctx->decoding_active && ctx->video_active && QUEUE_EMPTY(v_queue)) {
-            // video finished
-            deinit_av_streaming(ctx);
-            ctx->video_active = false;
-        }
-
         if (!ctx->paused && ctx->video_active)
             update_frames(surface, ctx);
 
-        // Events
+        //---Events---
         if (IsKeyPressed(KEY_SPACE)) {
             ctx->paused = !ctx->paused;
         }
         float scroll = GetMouseWheelMoveV().y;
         if (IsKeyPressed(KEY_UP) || scroll > 0.0f) {
-            float step = scroll ? VOLUME_STEP : VOLUME_STEP * 4.0f;
-            ctx->volume += step;
-            ctx->volume = ctx->volume > MAX_VOLUME ? MAX_VOLUME : ctx->volume;
-            SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+            if (!ctx->muted) {
+                float step = scroll ? VOLUME_STEP : VOLUME_STEP * 4.0f;
+                ctx->volume += step;
+                ctx->volume = ctx->volume > MAX_VOLUME ? MAX_VOLUME : ctx->volume;
+                SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+            }
         } else if (IsKeyPressed(KEY_DOWN) || scroll < 0.0f) {
-            float step = scroll ? VOLUME_STEP : VOLUME_STEP * 4.0f;
-            ctx->volume -= step;
-            ctx->volume = ctx->volume < 0.0f ? 0.0f : ctx->volume;
-            SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+            if (!ctx->muted) {
+                float step = scroll ? VOLUME_STEP : VOLUME_STEP * 4.0f;
+                ctx->volume -= step;
+                ctx->volume = ctx->volume < 0.0f ? 0.0f : ctx->volume;
+                SetAudioStreamVolume(ctx->audio_stream, ctx->volume);
+            }
         }
         if (IsKeyPressed(KEY_M)) {
             if (ctx->muted)
@@ -583,6 +617,7 @@ void main_loop(VideoContext *ctx, Texture surface)
                 pressed_last_frame = false;
             }
         }
+
         // Rendering
         ClearBackground(BLACK);
 
@@ -701,7 +736,7 @@ int main(int argc, char *argv[])
         .width = vid_width,
         .height = vid_height,
         .mipmaps = 1,        
-        .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+        .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8,
         .data = ctx.out_frame->data[0],
     };
     Texture surface = LoadTextureFromImage(img);
@@ -731,6 +766,7 @@ int main(int argc, char *argv[])
     LOG("PLAYING...");
 
     main_loop(&ctx, surface);
+    deinit_av_streaming(&ctx);
 
     CloseWindow();
     CloseAudioDevice();
