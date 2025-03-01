@@ -1,5 +1,4 @@
-jplay
-misc
-lib/*
+zig-out
+.zig-cache
 *.mp4
 *.webm

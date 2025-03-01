@@ -1,0 +1,22 @@
+.{
+    .name = "jplayer",
+    .version = "0.0.0",
+    .dependencies = .{
+        .libffmpeg = .{
+            .url = "https://github.com/allyourcodebase/ffmpeg/archive/refs/tags/7.0.1-4.tar.gz",
+            .hash = "1220b5d387335cb76a0eda4ab3e3c9ed153cbc3d1b5bb63c4899b5dfab3f826f4413",
+        },
+        .@"raylib-zig" = .{
+            .url = "git+https://github.com/Not-Nik/raylib-zig?ref=devel#bc82c6ebd7b9ba31437f3dcf34064106749edcf7",
+            .hash = "1220c35d89a132529b7081dde0778f00719c0f6b76f7e88fe6c7af0843a0d92dfb7c",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}

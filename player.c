@@ -423,7 +423,7 @@ void *decode_thread_func(void *arg)
             }
         } else if (!ctx->io_active) {
             ctx->decoding_active = false;
-            LOG("VIDEO DECODING DONE");
+            //LOG("VIDEO DECODING DONE");
             break;
         }
         if (ctx->is_split && !QUEUE_EMPTY(packets2) && !QUEUE_FULL(a_queue)) {
@@ -433,7 +433,7 @@ void *decode_thread_func(void *arg)
 
         if (audio_done && video_done) {
             ctx->decoding_active = false;
-            LOG("VIDEO DECODING DONE");
+            //LOG("VIDEO DECODING DONE");
             break;
         }
     }
@@ -554,14 +554,14 @@ void render_ui(VideoContext *ctx, Rectangle rect)
         DrawRectangleLines(x, y, pause_width, pause_height, BLACK);
     }
 
-    if (!ctx->video_active) {
-        float font_size = rect.height * PAUSE_SCALE;
-        const char *text = TextFormat("Restart?");
-        int width = MeasureText(text, font_size);
-        int x = rect.x + (rect.width - width) / 2;
-        int y = rect.y + (rect.height - font_size) / 2;
-        DrawText(text, x, y, font_size, RAYWHITE);
-    }
+    /*if (!ctx->video_active) {*/
+    /*    float font_size = rect.height * PAUSE_SCALE;*/
+    /*    const char *text = TextFormat("Restart?");*/
+    /*    int width = MeasureText(text, font_size);*/
+    /*    int x = rect.x + (rect.width - width) / 2;*/
+    /*    int y = rect.y + (rect.height - font_size) / 2;*/
+    /*    DrawText(text, x, y, font_size, RAYWHITE);*/
+    /*}*/
 
 }
 
