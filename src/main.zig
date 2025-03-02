@@ -2,7 +2,7 @@ const std = @import("std");
 const rl = @import("raylib");
 const av = @import("av");
 const VideoContext = @import("VideoContext.zig");
-const c = @import("c.zig").c;
+const c = @import("sw.zig").c;
 
 // some namespacing
 const Thread = std.Thread;
@@ -37,6 +37,21 @@ fn usage(args: [][]u8) void {
     std.process.exit(1);
 }
 
+fn get_time_string(buf: []u8, seconds: i32) ![]u8 {
+    if (seconds < 60 * 60) {
+        const s = seconds % 60;
+        const m = seconds / 60;
+        try std.fmt.bufPrint(buf, "{d:02}:{d:02}", .{ m, s });
+        return buf;
+    } else {
+        const s = seconds % 60;
+        const m = (seconds / 60) % 60;
+        const h = seconds / (60 * 60) % 60;
+        try std.fmt.bufPrint(buf, "{d:02}:{d:02}:{d:02}", .{ h, m, s });
+        return buf;
+    }
+}
+
 // returns true if the video i
 fn getYtFiles(alloc: std.mem.Allocator, url: [:0]u8, yt_dlp_args: ?[:0]u8) struct { [:0]u8, ?[:0]u8 } {
     _ = alloc;
@@ -45,6 +60,7 @@ fn getYtFiles(alloc: std.mem.Allocator, url: [:0]u8, yt_dlp_args: ?[:0]u8) struc
 }
 
 fn mainLoop(surface: rl.Texture, ctx: *VideoContext) void {
+    rl.playAudioStream(ctx.audio_stream);
     while (!rl.windowShouldClose()) {
         rl.clearBackground(rl.Color.black);
 
@@ -132,7 +148,7 @@ pub fn main() !void {
     rl.initWindow(
         @divTrunc(default_window_height * vid_width, vid_height),
         default_window_height,
-        "Epic",
+        video_file,
     );
     rl.setTargetFPS(120);
     rl.initAudioDevice();
@@ -147,9 +163,11 @@ pub fn main() !void {
         .data = video_ctx.out_frame.data[0],
     };
     const surface = try image.toTexture();
+    rl.setTextureFilter(surface, .bilinear);
 
     // audio
     try video_ctx.initAudio();
+    info("Playing...", .{});
 
     mainLoop(surface, &video_ctx);
 }

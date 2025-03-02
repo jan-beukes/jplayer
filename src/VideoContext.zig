@@ -1,7 +1,7 @@
 const std = @import("std");
 const av = @import("av");
 const rl = @import("raylib");
-const c = @import("c.zig").c;
+const sw = @import("sw.zig");
 
 const info = std.log.info;
 const warn = std.log.warn;
@@ -17,36 +17,40 @@ v_decoder: Decoder,
 a_decoder: Decoder,
 is_split: bool = false,
 
-out_frame: *av.Frame = undefined,
-sws_ctx: *c.SwsContext = undefined,
-swr_ctx: ?*c.SwrContext = null,
+packets: *Queue(*av.Packet),
+packets2: ?*Queue(*av.Packet) = null,
 
+// conversion
+out_frame: *av.Frame = undefined,
+sws_ctx: *sw.SwsContext = undefined,
+swr_ctx: ?*sw.SwrContext = null,
+
+// audio
 audio_stream: rl.AudioStream = undefined,
 audio_buffer: []u8 = undefined,
+buffer_size: u32 = 0,
 volume: f32 = 1.0,
 sample_size: i32 = 0,
 
+// state
 video_active: bool = false,
 io_active: bool = false,
 paused: bool = false,
 muted: bool = false,
 
+// clock
+video_clock: i64 = 0,
+audio_clock: i64 = 0,
+
 pub fn ioThreadFunc(ctx: *VideoContext) void {
-    const packet = av.Packet.alloc() catch {
-        err("Allocating IO packet", .{});
-        return;
-    };
     var done = false;
-    //var ret = 0;
-    const v_packets = &ctx.v_decoder.packets;
-    const a_packets = &ctx.a_decoder.packets;
 
     while (true) {
         if (rl.isWindowReady() and rl.windowShouldClose()) break;
 
-        if (!ctx.is_split) {
-            if (v_packets.full() or a_packets.full()) continue;
-            ctx.v_decoder.format_ctx.read_frame(packet) catch |e| {
+        if (!ctx.is_split and !ctx.packets.full()) {
+            const back = ctx.packets.back();
+            ctx.v_decoder.format_ctx.read_frame(back) catch |e| {
                 switch (e) {
                     error.EndOfFile => {
                         break;
@@ -54,68 +58,110 @@ pub fn ioThreadFunc(ctx: *VideoContext) void {
                     else => warn("reading frame, {}", .{e}),
                 }
             };
-            if (packet.stream_index == ctx.v_decoder.index) {
-                const back = v_packets.back();
-                c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
-                v_packets.inc();
-            } else if (packet.stream_index == ctx.a_decoder.index) {
-                const back = a_packets.back();
-                c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
-                a_packets.inc();
-            }
-        } else {
-            if (!v_packets.full()) {
-                const back = v_packets.back();
+            ctx.packets.inc();
+        } else if (ctx.packets2) |packets2| {
+            if (!ctx.packets.full()) {
+                const back = ctx.packets.back();
                 ctx.v_decoder.format_ctx.read_frame(back) catch |e| switch (e) {
                     error.EndOfFile => {
                         if (done) break else done = true;
                     },
                     else => warn("reading video frame, {}", .{e}),
                 };
-                v_packets.inc();
+                ctx.packets.inc();
             }
-            if (!a_packets.full()) {
-                const back = a_packets.back();
+            if (packets2.full()) {
+                const back = packets2.back();
                 ctx.a_decoder.format_ctx.read_frame(back) catch |e| switch (e) {
                     error.EndOfFile => {
                         if (done) break else done = true;
                     },
                     else => warn("reading audio frame, {}", .{e}),
                 };
+                packets2.inc();
             }
         }
     }
     ctx.io_active = false;
-    packet.free();
-    info("IO done", .{});
 }
 
 pub fn decodeThreadFunc(ctx: *VideoContext) void {
     while (ctx.v_decoder.active or ctx.a_decoder.active) {
         if (rl.isWindowReady() and rl.windowShouldClose()) break;
 
-        ctx.v_decoder.decode() catch |e| switch (e) {
-            error.PacketQueueEmpty => {
-                if (!ctx.io_active) ctx.v_decoder.active = false;
-            },
-            else => {},
-        };
-
-        ctx.a_decoder.decode() catch |e| switch (e) {
-            error.PacketQueueEmpty => {
-                if (!ctx.io_active) ctx.a_decoder.active = false;
-            },
-            else => {},
-        };
+        if (!ctx.is_split and !ctx.packets.empty()) {
+            var packet = ctx.packets.peek();
+            if (!ctx.v_decoder.frames.full() and packet.stream_index == ctx.v_decoder.index) {
+                packet = ctx.packets.dequeue();
+                ctx.v_decoder.decode(packet);
+            } else if (!ctx.a_decoder.frames.full() and packet.stream_index == ctx.a_decoder.index) {
+                packet = ctx.packets.dequeue();
+                ctx.a_decoder.decode(packet);
+            }
+        } else if (ctx.is_split) {
+            const packets2 = ctx.packets2.?;
+            if (!ctx.packets.empty()) {
+                const packet = ctx.packets.dequeue();
+                ctx.v_decoder.decode(packet);
+            }
+            if (!packets2.empty()) {
+                const packet = packets2.dequeue();
+                ctx.a_decoder.decode(packet);
+            }
+        }
     }
 }
 
 pub fn update(self: *VideoContext, surface: rl.Texture) void {
-    _ = surface;
     const v_frames = &self.v_decoder.frames;
     const a_frames = &self.a_decoder.frames;
 
-    info("{} {} {} {}", .{ self.v_decoder.packets.size(), self.a_decoder.packets.size(), v_frames.size(), a_frames.size() });
+    if (!self.v_decoder.active and
+        !self.a_decoder.active and
+        v_frames.empty() and a_frames.empty())
+    {
+        self.video_active = false;
+        return;
+    }
+
+    if (!a_frames.empty() and rl.isAudioStreamProcessed(self.audio_stream)) {
+        a_frames.mutex.lock();
+        const frame = a_frames.dequeueNoLock();
+        // convert from input sample format to interlaced FLT
+        _ = sw.swr_convert(
+            self.swr_ctx,
+            @ptrCast(&self.audio_buffer.ptr),
+            @intCast(self.audio_buffer.len),
+            &frame.data,
+            frame.nb_samples,
+        );
+        self.audio_clock += frame.nb_samples;
+        rl.updateAudioStream(self.audio_stream, self.audio_buffer.ptr, frame.nb_samples);
+        frame.unref();
+        a_frames.mutex.unlock();
+    }
+
+    if (!v_frames.empty()) {
+        v_frames.mutex.lock();
+        const frame = v_frames.peekNoLock();
+        const next_ts = @as(f64, @floatFromInt(frame.pts)) * self.v_decoder.ctx.time_base.q2d();
+        const a_clock: f64 = @floatFromInt(self.audio_clock);
+        const sample_rate: f64 = @floatFromInt(self.audio_stream.sampleRate);
+        const audio_time = a_clock / sample_rate;
+
+        if (audio_time >= next_ts) {
+            self.video_clock = frame.pts;
+            _ = v_frames.dequeueNoLock();
+            v_frames.mutex.unlock();
+
+            // convert to rgb
+            _ = sw.sws_scale_frame(self.sws_ctx, self.out_frame, frame);
+            rl.updateTexture(surface, self.out_frame.data[0]);
+            frame.unref();
+        } else {
+            v_frames.mutex.unlock();
+        }
+    }
 }
 
 pub fn seek(self: *VideoContext, time_stamp: i64) void {
@@ -125,7 +171,29 @@ pub fn seek(self: *VideoContext, time_stamp: i64) void {
 }
 
 pub fn initAudio(self: *VideoContext) !void {
-    self.audio_buffer = try self.allocator.alloc(u8, 1024);
+    // Because of buffer filling issues when frame size is unknown we scan the frames for a value
+    var buffer_size: u32 = @intCast(self.a_decoder.ctx.frame_size);
+    const a_ctx = self.a_decoder.ctx;
+    const a_frames = self.a_decoder.frames;
+    if (buffer_size <= 0) {
+        for (a_frames.items) |frame| {
+            buffer_size = if (frame.nb_samples > buffer_size)
+                @intCast(frame.nb_samples)
+            else
+                buffer_size;
+        }
+    }
+    assert(buffer_size != 0);
+    self.buffer_size = buffer_size;
+    rl.setAudioStreamBufferSizeDefault(@intCast(buffer_size));
+    self.audio_stream = try rl.loadAudioStream(
+        @intCast(a_ctx.sample_rate),
+        @intCast(self.sample_size),
+        @intCast(a_ctx.ch_layout.nb_channels),
+    );
+    rl.setAudioStreamVolume(self.audio_stream, self.volume);
+    const size: usize = buffer_size * self.audio_stream.channels * (self.audio_stream.sampleSize / 8);
+    self.audio_buffer = try self.allocator.alloc(u8, size);
 }
 
 // setup audio and frame format conversion
@@ -133,14 +201,14 @@ fn initFrameConversion(self: *VideoContext) !void {
     const format = self.v_decoder.ctx.pix_fmt;
     const width = self.v_decoder.ctx.width;
     const height = self.v_decoder.ctx.height;
-    const sws_ctx = c.sws_getContext(
+    const sws_ctx = sw.sws_getContext(
         width,
         height,
-        @intFromEnum(format),
+        format,
         width,
         height,
-        c.AV_PIX_FMT_RGB24,
-        c.SWS_BILINEAR,
+        .RGB24,
+        .{ .BILINEAR = true },
         null,
         null,
         null,
@@ -153,15 +221,12 @@ fn initFrameConversion(self: *VideoContext) !void {
 
     var ret: i32 = undefined;
     self.out_frame = try av.Frame.alloc();
-    self.out_frame.width = width;
-    self.out_frame.height = height;
-    self.out_frame.format = self.a_decoder.ctx.sample_fmt;
-    ret = c.av_image_alloc(
-        @ptrCast(&self.out_frame.data),
-        @ptrCast(&self.out_frame.linesize),
-        self.out_frame.width,
-        self.out_frame.height,
-        @intFromEnum(self.out_frame.format),
+    ret = sw.av_image_alloc(
+        self.out_frame.data[0..].ptr,
+        self.out_frame.linesize[0..].ptr,
+        width,
+        height,
+        .RGB24,
         1,
     );
     if (ret < 0) {
@@ -171,13 +236,14 @@ fn initFrameConversion(self: *VideoContext) !void {
 
     // Sample conversion
     const a_ctx = self.a_decoder.ctx;
-    ret = c.swr_alloc_set_opts2(
+    self.sample_size = 32;
+    ret = sw.swr_alloc_set_opts2(
         &self.swr_ctx,
-        @ptrCast(&a_ctx.ch_layout),
-        c.AV_SAMPLE_FMT_FLT,
+        &a_ctx.ch_layout,
+        .FLT,
         a_ctx.sample_rate,
-        @ptrCast(&a_ctx.ch_layout),
-        @intFromEnum(a_ctx.sample_fmt),
+        &a_ctx.ch_layout,
+        a_ctx.sample_fmt,
         a_ctx.sample_rate,
         0,
         null,
@@ -187,7 +253,7 @@ fn initFrameConversion(self: *VideoContext) !void {
         std.process.exit(1);
     }
 
-    if (c.swr_init(self.swr_ctx) < 0) {
+    if (sw.swr_init(self.swr_ctx) < 0) {
         err("Could not alloc swresample", .{});
         std.process.exit(1);
     }
@@ -223,12 +289,24 @@ pub fn init(alloc: std.mem.Allocator, video_file: [:0]u8, audio_file: ?[:0]u8) !
         };
     }
     info("Format {s}", .{format_ctx.iformat.long_name});
-    const v_decoder = try Decoder.init(format_ctx, .VIDEO);
-    const a_decoder = try Decoder.init(format_ctx2, .AUDIO);
+
+    // Packet queues
+    const packets = try alloc.create(Queue(*av.Packet));
+    packets.* = try Queue(*av.Packet).init();
+    var packets2: *Queue(*av.Packet) = undefined;
+    if (is_split) {
+        packets2 = try alloc.create(Queue(*av.Packet));
+        packets2.* = try Queue(*av.Packet).init();
+    }
+    const v_decoder = try Decoder.init(format_ctx, .VIDEO, packets);
+    const a_decoder = try Decoder.init(format_ctx2, .AUDIO, packets2);
+
     var ctx = VideoContext{
         .v_decoder = v_decoder,
         .a_decoder = a_decoder,
         .allocator = alloc,
+        .packets = packets,
+        .packets2 = if (is_split) packets2 else null,
     };
 
     try ctx.initFrameConversion();
@@ -238,9 +316,13 @@ pub fn init(alloc: std.mem.Allocator, video_file: [:0]u8, audio_file: ?[:0]u8) !
 pub fn deinit(self: *VideoContext) void {
     self.v_decoder.deinit();
     self.a_decoder.deinit();
+    for (self.packets.items) |packet| {
+        packet.free();
+    }
+    if (self.is_split) {}
     self.out_frame.free();
-    c.sws_freeContext(self.sws_ctx);
-    c.swr_free(&self.swr_ctx);
+    sw.sws_freeContext(self.sws_ctx);
+    sw.swr_free(&self.swr_ctx);
     self.allocator.free(self.audio_buffer);
 }
 
@@ -249,7 +331,7 @@ pub const Decoder = struct {
     ctx: *av.CodecContext,
     index: usize = 0,
 
-    packets: Queue(*av.Packet),
+    packets: *Queue(*av.Packet),
     frames: Queue(*av.Frame),
 
     fps: i32,
@@ -257,29 +339,19 @@ pub const Decoder = struct {
 
     active: bool = false,
 
-    // returns true if a frame was successfully decoded
-    const DecodeError = error{
-        PacketQueueEmpty,
-        FrameQueueFull,
-        AVError,
-    };
-
-    fn decode(self: *Decoder) DecodeError!void {
+    fn decode(self: *Decoder, packet: *av.Packet) void {
         if (!self.active) return;
-        if (self.packets.empty()) return DecodeError.PacketQueueEmpty;
-        if (self.frames.full()) return DecodeError.FrameQueueFull;
 
-        const packet = self.packets.dequeue();
         self.ctx.send_packet(packet) catch |e| {
             switch (e) {
                 error.WouldBlock => warn("Packet not accepted", .{}),
                 error.EndOfFile => warn("Decoder has been flushed", .{}),
                 else => warn("sending packet, {}", .{e}),
             }
-            return error.AVError;
+            return;
         };
 
-        const frame = self.frames.back();
+        var frame = self.frames.back();
         while (!self.frames.full()) {
             self.ctx.receive_frame(frame) catch |e| switch (e) {
                 error.EndOfFile => {
@@ -293,10 +365,11 @@ pub const Decoder = struct {
                 },
             };
             self.frames.inc();
+            frame = self.frames.back();
         }
     }
 
-    fn init(format_ctx: *av.FormatContext, media_type: av.MediaType) !Decoder {
+    fn init(format_ctx: *av.FormatContext, media_type: av.MediaType, packets: *Queue(*av.Packet)) !Decoder {
         var codec: *const av.Codec = undefined;
         var ret: i32 = 0;
         ret = av.av_find_best_stream(format_ctx, media_type, -1, -1, @ptrCast(&codec), 0);
@@ -335,7 +408,6 @@ pub const Decoder = struct {
             std.process.exit(1);
         };
 
-        const packets = try Queue(*av.Packet).init();
         const frames = try Queue(*av.Frame).init();
 
         return Decoder{
@@ -350,9 +422,6 @@ pub const Decoder = struct {
     }
 
     fn deinit(self: *Decoder) void {
-        for (self.packets.items) |packet| {
-            packet.free();
-        }
         for (self.frames.items) |frame| {
             frame.free();
         }
@@ -360,18 +429,21 @@ pub const Decoder = struct {
     }
 };
 
+// Thread *safe* queue with locked operations
 pub fn Queue(comptime T: type) type {
     return struct {
         const Self = @This();
+        const default_packet_cap = 64;
+        const default_frame_cap = 32;
+        const cap = if (T == *av.Frame) default_frame_cap else default_packet_cap;
 
-        const default_capacity = 32;
-        items: [default_capacity]T,
+        items: [cap]T,
         windex: usize,
         rindex: usize,
         mutex: std.Thread.Mutex,
 
         pub fn init() !Self {
-            var items: [default_capacity]T = undefined;
+            var items: [cap]T = undefined;
             if (T == *av.Frame) {
                 for (0..items.len) |i|
                     items[i] = try av.Frame.alloc();
@@ -391,10 +463,26 @@ pub fn Queue(comptime T: type) type {
 
         pub fn dequeue(self: *Self) T {
             self.mutex.lock();
-            const ret = self.items[self.rindex];
-            self.rindex = (self.rindex + 1) % self.items.len;
+            const ret = self.dequeueNoLock();
             self.mutex.unlock();
             return ret;
+        }
+
+        pub fn dequeueNoLock(self: *Self) T {
+            const ret = self.items[self.rindex];
+            self.rindex = (self.rindex + 1) % self.items.len;
+            return ret;
+        }
+
+        pub fn peek(self: *Self) T {
+            self.mutex.lock();
+            const ret = self.peekNoLock();
+            self.mutex.unlock();
+            return ret;
+        }
+
+        pub fn peekNoLock(self: Self) T {
+            return self.items[self.rindex];
         }
 
         pub fn inc(self: *Self) void {
