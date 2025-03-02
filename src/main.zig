@@ -130,13 +130,13 @@ pub fn main() !void {
     rl.setTraceLogLevel(.warning);
     rl.setConfigFlags(.{ .window_resizable = true });
     rl.initWindow(
-        default_window_height * @divTrunc(vid_width, vid_height),
+        @divTrunc(default_window_height * vid_width, vid_height),
         default_window_height,
         "Epic",
     );
     rl.setTargetFPS(120);
     rl.initAudioDevice();
-    rl.setWindowMinSize(min_window_height * @divTrunc(vid_width, vid_height), min_window_height);
+    rl.setWindowMinSize(@divTrunc(min_window_height * vid_width, vid_height), min_window_height);
 
     // Frame buffer
     const image = rl.Image{

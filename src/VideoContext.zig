@@ -39,28 +39,29 @@ pub fn ioThreadFunc(ctx: *VideoContext) void {
     var done = false;
     //var ret = 0;
     const v_packets = &ctx.v_decoder.packets;
-    const a_packets = &ctx.v_decoder.packets;
+    const a_packets = &ctx.a_decoder.packets;
 
     while (true) {
         if (rl.isWindowReady() and rl.windowShouldClose()) break;
 
         if (!ctx.is_split) {
-            if (!v_packets.full() and !a_packets.full()) {
-                ctx.v_decoder.format_ctx.read_frame(packet) catch |e| {
-                    switch (e) {
-                        error.EndOfFile => break,
-                        else => warn("reading frame, {}", .{e}),
-                    }
-                };
-                if (packet.stream_index == ctx.v_decoder.index) {
-                    const back = v_packets.back();
-                    c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
-                    v_packets.inc();
-                } else {
-                    const back = a_packets.back();
-                    c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
-                    a_packets.inc();
+            if (v_packets.full() or a_packets.full()) continue;
+            ctx.v_decoder.format_ctx.read_frame(packet) catch |e| {
+                switch (e) {
+                    error.EndOfFile => {
+                        break;
+                    },
+                    else => warn("reading frame, {}", .{e}),
                 }
+            };
+            if (packet.stream_index == ctx.v_decoder.index) {
+                const back = v_packets.back();
+                c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
+                v_packets.inc();
+            } else if (packet.stream_index == ctx.a_decoder.index) {
+                const back = a_packets.back();
+                c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
+                a_packets.inc();
             }
         } else {
             if (!v_packets.full()) {
@@ -84,17 +85,43 @@ pub fn ioThreadFunc(ctx: *VideoContext) void {
             }
         }
     }
-
+    ctx.io_active = false;
     packet.free();
     info("IO done", .{});
 }
 
 pub fn decodeThreadFunc(ctx: *VideoContext) void {
-    _ = ctx;
+    while (ctx.v_decoder.active or ctx.a_decoder.active) {
+        if (rl.isWindowReady() and rl.windowShouldClose()) break;
+
+        ctx.v_decoder.decode() catch |e| switch (e) {
+            error.PacketQueueEmpty => {
+                if (!ctx.io_active) ctx.v_decoder.active = false;
+            },
+            else => {},
+        };
+
+        ctx.a_decoder.decode() catch |e| switch (e) {
+            error.PacketQueueEmpty => {
+                if (!ctx.io_active) ctx.a_decoder.active = false;
+            },
+            else => {},
+        };
+    }
 }
+
 pub fn update(self: *VideoContext, surface: rl.Texture) void {
-    _ = self;
     _ = surface;
+    const v_frames = &self.v_decoder.frames;
+    const a_frames = &self.a_decoder.frames;
+
+    info("{} {} {} {}", .{ self.v_decoder.packets.size(), self.a_decoder.packets.size(), v_frames.size(), a_frames.size() });
+}
+
+pub fn seek(self: *VideoContext, time_stamp: i64) void {
+    _ = self;
+    _ = time_stamp;
+    //self.v_decoder.format_ctx.seek_frame()
 }
 
 pub fn initAudio(self: *VideoContext) !void {
@@ -230,6 +257,45 @@ pub const Decoder = struct {
 
     active: bool = false,
 
+    // returns true if a frame was successfully decoded
+    const DecodeError = error{
+        PacketQueueEmpty,
+        FrameQueueFull,
+        AVError,
+    };
+
+    fn decode(self: *Decoder) DecodeError!void {
+        if (!self.active) return;
+        if (self.packets.empty()) return DecodeError.PacketQueueEmpty;
+        if (self.frames.full()) return DecodeError.FrameQueueFull;
+
+        const packet = self.packets.dequeue();
+        self.ctx.send_packet(packet) catch |e| {
+            switch (e) {
+                error.WouldBlock => warn("Packet not accepted", .{}),
+                error.EndOfFile => warn("Decoder has been flushed", .{}),
+                else => warn("sending packet, {}", .{e}),
+            }
+            return error.AVError;
+        };
+
+        const frame = self.frames.back();
+        while (!self.frames.full()) {
+            self.ctx.receive_frame(frame) catch |e| switch (e) {
+                error.EndOfFile => {
+                    self.active = false;
+                    return;
+                },
+                error.WouldBlock => break,
+                else => {
+                    warn("Receiving frame, {}", .{e});
+                    break;
+                },
+            };
+            self.frames.inc();
+        }
+    }
+
     fn init(format_ctx: *av.FormatContext, media_type: av.MediaType) !Decoder {
         var codec: *const av.Codec = undefined;
         var ret: i32 = 0;
@@ -247,12 +313,11 @@ pub const Decoder = struct {
 
         // setup fps and time_base
         var fps: i32 = 0;
-        const av_time_base: f64 = @floatFromInt(c.AV_TIME_BASE);
-        const duration: f64 = @as(f64, @floatFromInt(format_ctx.duration)) / av_time_base;
+        ctx.time_base = format_ctx.streams[index].time_base;
+        const duration: f64 = @as(f64, @floatFromInt(format_ctx.duration)) / ctx.time_base.q2d();
         switch (media_type) {
             .VIDEO => {
-                const framerate = format_ctx.streams[index].avg_frame_rate;
-                fps = @divTrunc(framerate.num, framerate.den);
+                fps = @intFromFloat(format_ctx.streams[index].avg_frame_rate.q2d());
                 info(
                     "Video {}x{} at {}fps",
                     .{ ctx.width, ctx.height, fps },
@@ -303,8 +368,7 @@ pub fn Queue(comptime T: type) type {
         items: [default_capacity]T,
         windex: usize,
         rindex: usize,
-        mutex: std.Thread.Mutex = std.Thread.Mutex{},
-        locked: bool = false,
+        mutex: std.Thread.Mutex,
 
         pub fn init() !Self {
             var items: [default_capacity]T = undefined;
@@ -321,62 +385,55 @@ pub fn Queue(comptime T: type) type {
                 .items = items,
                 .windex = 0,
                 .rindex = 0,
+                .mutex = std.Thread.Mutex{},
             };
         }
 
-        pub fn lock(self: *Self) void {
-            if (self.locked) return;
-            self.mutex.lock();
-            self.locked = true;
-        }
-
-        pub fn unlock(self: *Self) void {
-            if (!self.locked) return;
-            self.mutex.unlock();
-            self.locked = false;
-        }
-
         pub fn dequeue(self: *Self) T {
-            self.lock();
+            self.mutex.lock();
             const ret = self.items[self.rindex];
             self.rindex = (self.rindex + 1) % self.items.len;
-            self.unlock();
+            self.mutex.unlock();
             return ret;
         }
 
         pub fn inc(self: *Self) void {
-            self.lock();
+            self.mutex.lock();
             self.windex = (self.windex + 1) % self.items.len;
-            self.unlock();
+            self.mutex.unlock();
         }
 
         pub fn back(self: *Self) T {
-            self.lock();
+            self.mutex.lock();
             const ret = self.items[self.windex];
-            self.unlock();
+            self.mutex.unlock();
             return ret;
         }
 
         pub fn full(self: *Self) bool {
-            self.lock();
+            self.mutex.lock();
             const ret = (self.windex + 1) % self.items.len == self.rindex;
-            self.unlock();
+            self.mutex.unlock();
             return ret;
         }
 
         pub fn empty(self: *Self) bool {
-            self.lock();
+            self.mutex.lock();
             const ret = self.rindex == self.windex;
-            self.unlock();
+            self.mutex.unlock();
             return ret;
         }
 
-        pub fn size(self: Self) i32 {
+        pub fn size(self: *Self) usize {
+            self.mutex.lock();
+            var ret: usize = 0;
             if (self.windex >= self.rindex) {
-                return self.windex - self.rindex;
+                ret = self.windex - self.rindex;
             } else {
-                return self.items.len - self.rindex + self.windex + 1;
+                ret = self.items.len - self.rindex + self.windex + 1;
             }
+            self.mutex.unlock();
+            return ret;
         }
     };
 }
