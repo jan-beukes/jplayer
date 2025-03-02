@@ -2,6 +2,7 @@ const std = @import("std");
 const rl = @import("raylib");
 const av = @import("av");
 const VideoContext = @import("VideoContext.zig");
+const c = @import("c.zig").c;
 
 // some namespacing
 const Thread = std.Thread;
@@ -36,17 +37,11 @@ fn usage(args: [][]u8) void {
     std.process.exit(1);
 }
 
-fn ioThreadFunc(ctx: *VideoContext) void {
-    _ = ctx;
-    // var packet: *av.Packet = undefined;
-    // var done = false;
-    // var ret = 0;
-    //
-    // while (true) {}
-}
-
-fn decodeThreadFunc(ctx: *VideoContext) void {
-    _ = ctx;
+// returns true if the video i
+fn getYtFiles(alloc: std.mem.Allocator, url: [:0]u8, yt_dlp_args: ?[:0]u8) struct { [:0]u8, ?[:0]u8 } {
+    _ = alloc;
+    _ = yt_dlp_args;
+    return .{ url, null };
 }
 
 fn mainLoop(surface: rl.Texture, ctx: *VideoContext) void {
@@ -86,7 +81,7 @@ fn mainLoop(surface: rl.Texture, ctx: *VideoContext) void {
 
 fn parseArgs(args: [][:0]u8, yt_dlp: *?[]u8) [:0]u8 {
     const inner = struct {
-        var buf: [1024]u8 = undefined;
+        var buf: [1024:0]u8 = undefined;
     };
     _ = inner;
     _ = yt_dlp;
@@ -106,22 +101,25 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    var yt_dlp: ?[]u8 = null;
-    const video_file = parseArgs(args, &yt_dlp);
+    var yt_dlp: ?[:0]u8 = null;
+    const url = parseArgs(args, &yt_dlp);
+
+    const video_file, const audio_file = getYtFiles(alloc, url, yt_dlp);
 
     // initialization
-    var video_ctx = try VideoContext.init(alloc, video_file, yt_dlp);
+    var video_ctx = try VideoContext.init(alloc, video_file, audio_file);
 
     // launch threads
     video_ctx.video_active = true;
+    video_ctx.io_active = true;
     video_ctx.v_decoder.active = true;
     video_ctx.a_decoder.active = true;
-    var io_thread = Thread.spawn(.{}, ioThreadFunc, .{&video_ctx}) catch |e| {
+    var io_thread = Thread.spawn(.{}, VideoContext.ioThreadFunc, .{&video_ctx}) catch |e| {
         err("Failed to spawn io thread {}", .{e});
         std.process.exit(1);
     };
     io_thread.detach();
-    var decode_thread = Thread.spawn(.{}, decodeThreadFunc, .{&video_ctx}) catch |e| {
+    var decode_thread = Thread.spawn(.{}, VideoContext.decodeThreadFunc, .{&video_ctx}) catch |e| {
         err("Failed to spawn decoding thread {}", .{e});
         std.process.exit(1);
     };

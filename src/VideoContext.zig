@@ -1,11 +1,7 @@
 const std = @import("std");
 const av = @import("av");
 const rl = @import("raylib");
-const c = @cImport({
-    @cInclude("libswscale/swscale.h");
-    @cInclude("libswresample/swresample.h");
-    @cInclude("libavutil/imgutils.h");
-});
+const c = @import("c.zig").c;
 
 const info = std.log.info;
 const warn = std.log.warn;
@@ -23,7 +19,7 @@ is_split: bool = false,
 
 out_frame: *av.Frame = undefined,
 sws_ctx: *c.SwsContext = undefined,
-swr_ctx: *c.SwrContext = undefined,
+swr_ctx: ?*c.SwrContext = null,
 
 audio_stream: rl.AudioStream = undefined,
 audio_buffer: []u8 = undefined,
@@ -31,9 +27,71 @@ volume: f32 = 1.0,
 sample_size: i32 = 0,
 
 video_active: bool = false,
+io_active: bool = false,
 paused: bool = false,
 muted: bool = false,
 
+pub fn ioThreadFunc(ctx: *VideoContext) void {
+    const packet = av.Packet.alloc() catch {
+        err("Allocating IO packet", .{});
+        return;
+    };
+    var done = false;
+    //var ret = 0;
+    const v_packets = &ctx.v_decoder.packets;
+    const a_packets = &ctx.v_decoder.packets;
+
+    while (true) {
+        if (rl.isWindowReady() and rl.windowShouldClose()) break;
+
+        if (!ctx.is_split) {
+            if (!v_packets.full() and !a_packets.full()) {
+                ctx.v_decoder.format_ctx.read_frame(packet) catch |e| {
+                    switch (e) {
+                        error.EndOfFile => break,
+                        else => warn("reading frame, {}", .{e}),
+                    }
+                };
+                if (packet.stream_index == ctx.v_decoder.index) {
+                    const back = v_packets.back();
+                    c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
+                    v_packets.inc();
+                } else {
+                    const back = a_packets.back();
+                    c.av_packet_move_ref(@ptrCast(back), @ptrCast(packet));
+                    a_packets.inc();
+                }
+            }
+        } else {
+            if (!v_packets.full()) {
+                const back = v_packets.back();
+                ctx.v_decoder.format_ctx.read_frame(back) catch |e| switch (e) {
+                    error.EndOfFile => {
+                        if (done) break else done = true;
+                    },
+                    else => warn("reading video frame, {}", .{e}),
+                };
+                v_packets.inc();
+            }
+            if (!a_packets.full()) {
+                const back = a_packets.back();
+                ctx.a_decoder.format_ctx.read_frame(back) catch |e| switch (e) {
+                    error.EndOfFile => {
+                        if (done) break else done = true;
+                    },
+                    else => warn("reading audio frame, {}", .{e}),
+                };
+            }
+        }
+    }
+
+    packet.free();
+    info("IO done", .{});
+}
+
+pub fn decodeThreadFunc(ctx: *VideoContext) void {
+    _ = ctx;
+}
 pub fn update(self: *VideoContext, surface: rl.Texture) void {
     _ = self;
     _ = surface;
@@ -87,7 +145,7 @@ fn initFrameConversion(self: *VideoContext) !void {
     // Sample conversion
     const a_ctx = self.a_decoder.ctx;
     ret = c.swr_alloc_set_opts2(
-        @ptrCast(&self.swr_ctx),
+        &self.swr_ctx,
         @ptrCast(&a_ctx.ch_layout),
         c.AV_SAMPLE_FMT_FLT,
         a_ctx.sample_rate,
@@ -108,11 +166,7 @@ fn initFrameConversion(self: *VideoContext) !void {
     }
 }
 
-fn getYtFormat() void {}
-
-pub fn init(alloc: std.mem.Allocator, video_file: [:0]u8, yt_dlp_args: ?[]u8) !VideoContext {
-    _ = yt_dlp_args;
-
+pub fn init(alloc: std.mem.Allocator, video_file: [:0]u8, audio_file: ?[:0]u8) !VideoContext {
     av.LOG.set_level(.ERROR);
     info("Loading Video...", .{});
 
@@ -121,14 +175,29 @@ pub fn init(alloc: std.mem.Allocator, video_file: [:0]u8, yt_dlp_args: ?[]u8) !V
         std.process.exit(1);
     };
 
+    const format_ctx2 = if (audio_file) |file| blk: {
+        const ret = av.FormatContext.open_input(file, null, null, null) catch |e| {
+            err("Could not open video file {s}: {}", .{ video_file, e });
+            std.process.exit(1);
+        };
+        break :blk ret;
+    } else format_ctx;
+    const is_split = audio_file != null;
+
     // find the streams
     format_ctx.find_stream_info(null) catch |e| {
         err("Could not find stream info: {}", .{e});
         std.process.exit(1);
     };
+    if (is_split) {
+        format_ctx2.find_stream_info(null) catch |e| {
+            err("Could not find audio stream info: {}", .{e});
+            std.process.exit(1);
+        };
+    }
     info("Format {s}", .{format_ctx.iformat.long_name});
     const v_decoder = try Decoder.init(format_ctx, .VIDEO);
-    const a_decoder = try Decoder.init(format_ctx, .AUDIO);
+    const a_decoder = try Decoder.init(format_ctx2, .AUDIO);
     var ctx = VideoContext{
         .v_decoder = v_decoder,
         .a_decoder = a_decoder,
@@ -190,7 +259,7 @@ pub const Decoder = struct {
                 );
             },
             .AUDIO => info(
-                "Audio {} chanels, sample rate {}HZ, sample fmt {any}",
+                "Audio {} chanels, sample rate {}HZ, sample fmt {?s}",
                 .{ ctx.ch_layout.nb_channels, ctx.sample_rate, ctx.sample_fmt.get_name() },
             ),
             else => {},
@@ -232,8 +301,8 @@ pub fn Queue(comptime T: type) type {
 
         const default_capacity = 32;
         items: [default_capacity]T,
-        windex: i32,
-        rindex: i32,
+        windex: usize,
+        rindex: usize,
         mutex: std.Thread.Mutex = std.Thread.Mutex{},
         locked: bool = false,
 
@@ -255,19 +324,19 @@ pub fn Queue(comptime T: type) type {
             };
         }
 
-        pub fn lock(self: Self) void {
+        pub fn lock(self: *Self) void {
             if (self.locked) return;
             self.mutex.lock();
             self.locked = true;
         }
 
-        pub fn unlock(self: Self) void {
+        pub fn unlock(self: *Self) void {
             if (!self.locked) return;
             self.mutex.unlock();
             self.locked = false;
         }
 
-        pub fn dequeue(self: Self) T {
+        pub fn dequeue(self: *Self) T {
             self.lock();
             const ret = self.items[self.rindex];
             self.rindex = (self.rindex + 1) % self.items.len;
@@ -275,27 +344,27 @@ pub fn Queue(comptime T: type) type {
             return ret;
         }
 
-        pub fn inc(self: Self) void {
+        pub fn inc(self: *Self) void {
             self.lock();
             self.windex = (self.windex + 1) % self.items.len;
             self.unlock();
         }
 
-        pub fn back(self: Self) T {
+        pub fn back(self: *Self) T {
             self.lock();
             const ret = self.items[self.windex];
             self.unlock();
             return ret;
         }
 
-        pub fn full(self: Self) bool {
+        pub fn full(self: *Self) bool {
             self.lock();
             const ret = (self.windex + 1) % self.items.len == self.rindex;
             self.unlock();
             return ret;
         }
 
-        pub fn empty(self: Self) bool {
+        pub fn empty(self: *Self) bool {
             self.lock();
             const ret = self.rindex == self.windex;
             self.unlock();
